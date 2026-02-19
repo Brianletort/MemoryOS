@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memoryos.indexer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{VENV_PYTHON}}</string>
+        <string>-m</string>
+        <string>src.memory.indexer</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{REPO_DIR}}</string>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{REPO_DIR}}/logs/indexer.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{REPO_DIR}}/logs/indexer.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>{{REPO_DIR}}</string>
+    </dict>
+</dict>
+</plist>

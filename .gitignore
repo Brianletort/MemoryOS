@@ -1,0 +1,33 @@
+# Personal config (config.yaml.example is the shareable template)
+config/config.yaml
+
+# State and runtime
+config/state.json
+config/memory.db
+config/.graph_token_cache.bin
+config/.privacy_mode
+logs/
+
+# Auto-generated context files
+_context/
+
+# Personal migration scripts
+scripts/migrate_to_letort.py
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+.cursor/

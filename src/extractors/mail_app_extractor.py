@@ -53,7 +53,13 @@ def _run_osascript(script: str, *, timeout: int = 120) -> str:
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "execution error" in stderr:
-            logger.warning("AppleScript error: %s", stderr)
+            if "-1712" in stderr:
+                logger.warning(
+                    "Mail.app AppleEvent timed out (busy syncing). "
+                    "Will retry next cycle."
+                )
+            else:
+                logger.warning("AppleScript error: %s", stderr)
             return ""
         raise RuntimeError(f"osascript failed (rc={result.returncode}): {stderr}")
     return result.stdout.strip()
@@ -89,11 +95,18 @@ def _build_metadata_script(
     since: datetime | None = None,
     batch_size: int = 200,
 ) -> str:
-    """Build AppleScript to extract message metadata (no body -- fast)."""
-    date_filter = ""
+    """Build AppleScript to extract message metadata (no body -- fast).
+
+    Instead of filtering with ``whose date received > ...`` (which scans the
+    entire mailbox and times out on large Exchange accounts), we iterate the
+    first N messages (newest first) and stop when we hit one older than the
+    cutoff.  This is dramatically faster.
+    """
+    date_guard = ""
     if since:
-        date_filter = (
-            f'whose date received > date "{_applescript_date_literal(since)}"'
+        date_guard = (
+            f'if recvDate < date "{_applescript_date_literal(since)}" '
+            f"then exit repeat"
         )
 
     extract_loop = f'''
@@ -103,10 +116,14 @@ def _build_metadata_script(
 
     repeat with i from 1 to msgCount
         set m to item i of msgs
+        set recvDate to date received of m
+
+        {date_guard}
+
         set mid to id of m
         set subj to subject of m
         set fromStr to sender of m
-        set recvDate to date received of m as string
+        set recvStr to recvDate as string
 
         set toList to ""
         repeat with r in (to recipients of m)
@@ -122,7 +139,7 @@ def _build_metadata_script(
             end repeat
         end try
 
-        set output to output & mid & fieldSep & subj & fieldSep & fromStr & fieldSep & toList & fieldSep & ccList & fieldSep & recvDate & recSep
+        set output to output & mid & fieldSep & subj & fieldSep & fromStr & fieldSep & toList & fieldSep & ccList & fieldSep & recvStr & recSep
     end repeat
 '''
 
@@ -132,7 +149,7 @@ tell application "Mail"
     set fieldSep to ASCII character 30
     set recSep to ASCII character 31
     set output to ""
-    set msgs to (every message of inbox {date_filter})
+    set msgs to (every message of inbox)
 {extract_loop}
     return output
 end tell
@@ -145,7 +162,7 @@ tell application "Mail"
     set output to ""
     repeat with acct in every account
         try
-            set msgs to (every message of mailbox "{mailbox}" of acct {date_filter})
+            set msgs to (every message of mailbox "{mailbox}" of acct)
 {extract_loop}
         end try
     end repeat
@@ -172,7 +189,7 @@ def fetch_messages(
     script = _build_metadata_script(
         mailbox, since=since, batch_size=batch_size,
     )
-    raw = _run_osascript(script, timeout=60)
+    raw = _run_osascript(script, timeout=180)
     if not raw:
         return []
 

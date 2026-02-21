@@ -19,6 +19,7 @@ import argparse
 import logging
 import re
 import sqlite3
+import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -294,8 +295,27 @@ def render_calendar_note(
 
 # ── Main extraction logic ───────────────────────────────────────────────────
 
+def _is_new_outlook() -> bool:
+    """Detect if Outlook is in 'New Outlook' mode (cloud-only, no local DB writes)."""
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "com.microsoft.Outlook", "IsRunningNewOutlook"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
 def run(cfg: dict[str, Any], *, dry_run: bool = False, backfill: bool = False) -> None:
     """Run the Outlook extractor."""
+    if _is_new_outlook():
+        logger.warning(
+            "Outlook is in 'New Outlook' mode -- local SQLite DB is not updated. "
+            "Email extraction will use mail_app extractor instead."
+        )
+        return
+
     db_path = cfg["outlook"]["db_path"]
     messages_dir = Path(cfg["outlook"]["messages_dir"])
 

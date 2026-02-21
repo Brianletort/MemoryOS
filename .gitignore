@@ -4,6 +4,7 @@ config/config.yaml
 # State and runtime
 config/state.json
 config/memory.db
+config/watchdog_state.json
 config/.graph_token_cache.bin
 config/.privacy_mode
 logs/

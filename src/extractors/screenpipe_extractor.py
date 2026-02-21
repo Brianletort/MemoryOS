@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sqlite3
 import sys
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # Allow running as a script from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -125,6 +126,23 @@ def deduplicate_ocr(entries: list[OcrEntry], threshold: float = 0.85) -> list[Oc
         result.append(entry)
 
     logger.info("Deduplication: %d -> %d OCR entries", len(entries), len(result))
+    return result
+
+
+def deduplicate_audio(entries: list[AudioEntry], threshold: float = 0.85) -> list[AudioEntry]:
+    """Remove near-duplicate consecutive audio entries from the same speaker."""
+    if not entries:
+        return entries
+
+    result: list[AudioEntry] = [entries[0]]
+    for entry in entries[1:]:
+        prev = result[-1]
+        if (entry.speaker_id == prev.speaker_id
+                and text_similarity(entry.transcription, prev.transcription) >= threshold):
+            continue
+        result.append(entry)
+
+    logger.info("Audio dedup: %d -> %d entries", len(entries), len(result))
     return result
 
 
@@ -290,6 +308,96 @@ def group_audio_by_date(
     return grouped
 
 
+# ── Calendar correlation ──────────────────────────────────────────────────────
+
+_CALENDAR_HEADING_RE = re.compile(
+    r"^##\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2}):\s*(.+)$"
+)
+
+
+class CalendarEvent(NamedTuple):
+    start: datetime
+    end: datetime
+    title: str
+
+
+def parse_calendar_events(calendar_path: Path, date_str: str) -> list[CalendarEvent]:
+    """Parse event time ranges and titles from a calendar.md file.
+
+    Expects headings like ``## 11:00 - 12:00: Event Title``.
+    All-day events (no time range) are skipped.
+    """
+    if not calendar_path.is_file():
+        return []
+
+    events: list[CalendarEvent] = []
+    text = calendar_path.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        m = _CALENDAR_HEADING_RE.match(line.strip())
+        if not m:
+            continue
+        start_str, end_str, title = m.group(1), m.group(2), m.group(3).strip()
+        try:
+            start_t = datetime.strptime(f"{date_str} {start_str}", "%Y-%m-%d %H:%M")
+            end_t = datetime.strptime(f"{date_str} {end_str}", "%Y-%m-%d %H:%M")
+            start_t = start_t.astimezone()
+            end_t = end_t.astimezone()
+        except ValueError:
+            continue
+        events.append(CalendarEvent(start=start_t, end=end_t, title=title))
+
+    return events
+
+
+class MeetingAudioMatch(NamedTuple):
+    time_range: str
+    title: str
+    entries: list[AudioEntry]
+
+
+def match_audio_to_meetings(
+    audio_entries: list[AudioEntry],
+    events: list[CalendarEvent],
+    buffer_minutes: int = 5,
+) -> tuple[list[MeetingAudioMatch], list[AudioEntry]]:
+    """Bucket audio entries into calendar event windows.
+
+    Returns (matched_meetings, uncorrelated) where each matched meeting
+    contains a time range string, title, and list of audio entries whose
+    timestamps fall within the event window (expanded by buffer_minutes).
+    """
+    if not events:
+        return [], list(audio_entries)
+
+    buf = timedelta(minutes=buffer_minutes)
+
+    buckets: dict[int, list[AudioEntry]] = defaultdict(list)
+    uncorrelated: list[AudioEntry] = []
+
+    for ae in audio_entries:
+        placed = False
+        for idx, ev in enumerate(events):
+            if (ev.start - buf) <= ae.timestamp <= (ev.end + buf):
+                buckets[idx].append(ae)
+                placed = True
+                break
+        if not placed:
+            uncorrelated.append(ae)
+
+    matched: list[MeetingAudioMatch] = []
+    for idx, ev in enumerate(events):
+        if idx not in buckets:
+            continue
+        time_range = f"{ev.start.strftime('%H:%M')} - {ev.end.strftime('%H:%M')}"
+        matched.append(MeetingAudioMatch(
+            time_range=time_range,
+            title=ev.title,
+            entries=buckets[idx],
+        ))
+
+    return matched, uncorrelated
+
+
 # ── Markdown rendering ───────────────────────────────────────────────────────
 
 def render_daily_note(
@@ -361,8 +469,14 @@ def render_meeting_audio_note(
     date_str: str,
     audio_entries: list[AudioEntry],
     filtered_audio: list[AudioEntry] | None = None,
+    matched_meetings: list[MeetingAudioMatch] | None = None,
+    uncorrelated: list[AudioEntry] | None = None,
 ) -> str:
-    """Render meeting audio transcriptions for 10_meetings/."""
+    """Render meeting audio transcriptions for 10_meetings/.
+
+    When calendar correlation data is provided (matched_meetings / uncorrelated),
+    audio is grouped under meeting headings.  Otherwise falls back to a flat list.
+    """
     meta = {
         "date": date_str,
         "source": "screenpipe-audio",
@@ -371,11 +485,30 @@ def render_meeting_audio_note(
     }
     parts = [yaml_frontmatter(meta), "", f"# Meeting Audio -- {date_str}", ""]
 
-    for ae in audio_entries:
-        time_str = ae.timestamp.strftime("%H:%M")
-        speaker = _format_speaker(ae)
-        parts.append(f"**{speaker} ({time_str}):** {ae.transcription.strip()}")
-        parts.append("")
+    if matched_meetings is not None:
+        for meeting in matched_meetings:
+            parts.append(f"## {meeting.time_range}: {meeting.title}")
+            parts.append("")
+            for ae in meeting.entries:
+                time_str = ae.timestamp.strftime("%H:%M")
+                speaker = _format_speaker(ae)
+                parts.append(f"**{speaker} ({time_str}):** {ae.transcription.strip()}")
+                parts.append("")
+
+        if uncorrelated:
+            parts.append("## Uncorrelated Audio")
+            parts.append("")
+            for ae in uncorrelated:
+                time_str = ae.timestamp.strftime("%H:%M")
+                speaker = _format_speaker(ae)
+                parts.append(f"**{speaker} ({time_str}):** {ae.transcription.strip()}")
+                parts.append("")
+    else:
+        for ae in audio_entries:
+            time_str = ae.timestamp.strftime("%H:%M")
+            speaker = _format_speaker(ae)
+            parts.append(f"**{speaker} ({time_str}):** {ae.transcription.strip()}")
+            parts.append("")
 
     if filtered_audio:
         parts.append("---")
@@ -442,12 +575,22 @@ def render_teams_note(
     return "\n".join(parts)
 
 
+_PERSONAL_MIC_KEYWORDS = {"macbook", "airpods", "iphone microphone"}
+
+
 def _format_speaker(ae: AudioEntry) -> str:
-    """Format speaker label for audio entry."""
+    """Format speaker label for audio entry.
+
+    Only labels as "You" for personal microphones (MacBook, AirPods).
+    Shared input devices like speakerphones and virtual audio capture
+    both sides of a conversation, so they use speaker IDs.
+    """
     if ae.speaker_name:
         return ae.speaker_name
     if ae.is_input_device:
-        return "You"
+        device_lower = (ae.device or "").lower()
+        if any(kw in device_lower for kw in _PERSONAL_MIC_KEYWORDS):
+            return "You"
     return f"Speaker {ae.speaker_id or '?'}"
 
 
@@ -497,9 +640,10 @@ def run(cfg: dict[str, Any], *, dry_run: bool = False) -> None:
     ocr_entries = [OcrEntry(r) for r in ocr_rows]
     audio_entries = [AudioEntry(r) for r in audio_rows]
 
-    # Dedup OCR
+    # Dedup OCR and audio
     threshold = cfg.get("screenpipe_settings", {}).get("dedup_threshold", 0.85)
     ocr_entries = deduplicate_ocr(ocr_entries, threshold)
+    audio_entries = deduplicate_audio(audio_entries, threshold)
 
     # ── Audio noise filtering ──
     filter_result = filter_audio_entries(audio_entries, ocr_entries, cfg)
@@ -575,12 +719,26 @@ def run(cfg: dict[str, Any], *, dry_run: bool = False) -> None:
         audio_list = audio_kept_grouped[date_str]
         if not audio_list and not audio_filtered_grouped.get(date_str):
             continue
+
+        date_path = _date_to_path(date_str)
+        calendar_path = meetings_dir / date_path / "calendar.md"
+        events = parse_calendar_events(calendar_path, date_str)
+
+        matched, uncorrelated = match_audio_to_meetings(audio_list, events)
+        if events:
+            logger.info(
+                "Calendar correlation for %s: %d events, %d matched, %d uncorrelated",
+                date_str, len(events), len(matched), len(uncorrelated),
+            )
+
         audio_content = render_meeting_audio_note(
             date_str,
             audio_list,
             filtered_audio=audio_filtered_grouped.get(date_str, []),
+            matched_meetings=matched if events else None,
+            uncorrelated=uncorrelated if events else None,
         )
-        audio_path = meetings_dir / _date_to_path(date_str) / "audio.md"
+        audio_path = meetings_dir / date_path / "audio.md"
         if dry_run:
             logger.info("DRY RUN: Would write %d bytes to %s", len(audio_content), audio_path)
         else:

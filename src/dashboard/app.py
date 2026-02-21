@@ -313,6 +313,19 @@ async def api_status() -> JSONResponse:
 #  API: Pipeline Health
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/watchdog")
+async def api_watchdog() -> JSONResponse:
+    """Return the latest watchdog state if available."""
+    state_file = REPO_DIR / "config" / "watchdog_state.json"
+    if not state_file.is_file():
+        return JSONResponse({"error": "No watchdog data yet"}, status_code=404)
+    try:
+        data = json.loads(state_file.read_text())
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/pipeline-health")
 async def api_pipeline_health() -> JSONResponse:
     """Per-folder pipeline health: files today, newest file, total count."""
@@ -697,6 +710,58 @@ async def api_file(path: str = "") -> JSONResponse:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Skills API
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILLS_DIR = Path.home() / ".cursor" / "skills"
+
+
+@app.get("/api/skills")
+async def api_skills() -> JSONResponse:
+    """Return metadata and content for all installed agent skills."""
+    skills: list[dict[str, Any]] = []
+    if not SKILLS_DIR.is_dir():
+        return JSONResponse(skills)
+    for skill_dir in sorted(SKILLS_DIR.iterdir()):
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        try:
+            raw = skill_md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        name = skill_dir.name
+        description = ""
+        body = raw
+        if raw.startswith("---"):
+            end = raw.find("\n---", 3)
+            if end != -1:
+                fm_text = raw[3:end].strip()
+                body = raw[end + 4:].lstrip("\n")
+                for line in fm_text.splitlines():
+                    if line.startswith("description:"):
+                        description = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    elif line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip()
+        sections: list[str] = []
+        for s_line in body.splitlines():
+            if s_line.startswith("## "):
+                sections.append(s_line[3:].strip())
+        has_scripts = (skill_dir / "scripts").is_dir()
+        file_count = sum(1 for f in skill_dir.rglob("*") if f.is_file())
+        skills.append({
+            "name": name,
+            "dir_name": skill_dir.name,
+            "description": description,
+            "sections": sections,
+            "has_scripts": has_scripts,
+            "file_count": file_count,
+            "body": body,
+        })
+    return JSONResponse(skills)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HTML Dashboard — Full Control Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -894,6 +959,63 @@ body {
 .alert-warn { background: rgba(251,191,36,.1); border: 1px solid rgba(251,191,36,.3); color: var(--yellow); }
 .alert-error { background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.3); color: var(--red); }
 .alert-info { background: rgba(96,165,250,.1); border: 1px solid rgba(96,165,250,.3); color: var(--blue); }
+
+/* ── Skills tab ── */
+.skills-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.skill-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px; cursor: pointer; transition: border-color .15s, transform .1s;
+}
+.skill-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.skill-card-name { font-size: 1.1rem; font-weight: 600; margin-bottom: 6px; color: var(--accent); }
+.skill-card-desc { font-size: .82rem; color: var(--muted); line-height: 1.5; margin-bottom: 12px;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.skill-card-meta { display: flex; gap: 8px; flex-wrap: wrap; }
+.skill-tag {
+  display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: .7rem; font-weight: 500;
+  background: rgba(108,124,255,.12); color: var(--accent);
+}
+.skill-tag-scripts { background: rgba(74,222,128,.12); color: var(--green); }
+
+/* Skills modal */
+.skill-modal-backdrop {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  z-index: 200; justify-content: center; align-items: center; padding: 24px;
+}
+.skill-modal-backdrop.open { display: flex; }
+.skill-modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  max-width: 800px; width: 100%; max-height: 85vh; display: flex; flex-direction: column;
+}
+.skill-modal-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 18px 24px; border-bottom: 1px solid var(--border);
+}
+.skill-modal-title { font-size: 1.2rem; font-weight: 600; color: var(--accent); }
+.skill-modal-close { background: none; border: none; color: var(--muted); font-size: 1.5rem; cursor: pointer; padding: 0 4px; }
+.skill-modal-close:hover { color: var(--text); }
+.skill-modal-body {
+  padding: 24px; overflow-y: auto; font-size: .88rem; line-height: 1.65;
+}
+.skill-modal-body h1 { font-size: 1.15rem; margin: 16px 0 8px; color: var(--text); }
+.skill-modal-body h2 { font-size: 1.02rem; margin: 20px 0 8px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.skill-modal-body h3 { font-size: .92rem; margin: 14px 0 6px; color: var(--text); }
+.skill-modal-body p { margin: 6px 0; color: var(--text); }
+.skill-modal-body ul, .skill-modal-body ol { margin: 6px 0 6px 20px; color: var(--text); }
+.skill-modal-body li { margin: 3px 0; }
+.skill-modal-body code {
+  background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: .82rem; color: var(--blue);
+}
+.skill-modal-body pre {
+  background: var(--bg); padding: 12px 16px; border-radius: 8px; overflow-x: auto;
+  margin: 8px 0; border: 1px solid var(--border);
+}
+.skill-modal-body pre code { background: none; padding: 0; color: var(--green); font-size: .8rem; }
+.skill-modal-body table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: .82rem; }
+.skill-modal-body th { text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--muted); font-weight: 600; }
+.skill-modal-body td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.skill-modal-body strong { color: var(--text); }
+.skill-modal-body blockquote { border-left: 3px solid var(--accent); padding-left: 12px; margin: 8px 0; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -905,6 +1027,7 @@ body {
   <button class="top-tab" onclick="switchTab('settings',this)">Settings</button>
   <button class="top-tab" onclick="switchTab('browser',this)">File Browser</button>
   <button class="top-tab" onclick="switchTab('logs',this)">Logs</button>
+  <button class="top-tab" onclick="switchTab('skills',this)">Skills</button>
 </div>
 
 <!-- ══════ TAB 1: OVERVIEW ══════ -->
@@ -1058,6 +1181,24 @@ body {
 </div>
 </div><!-- /pane-logs -->
 
+<!-- ══════ TAB 6: SKILLS ══════ -->
+<div class="tab-pane" id="pane-skills">
+<h1 style="margin-bottom:4px">Agent Skills</h1>
+<p style="color:var(--muted);font-size:.82rem;margin-bottom:20px">Installed skills in ~/.cursor/skills/ &mdash; these extend what the AI agent can do</p>
+<div id="skills-grid" class="skills-grid">Loading skills...</div>
+</div><!-- /pane-skills -->
+
+<!-- Skills detail modal -->
+<div class="skill-modal-backdrop" id="skill-modal-backdrop" onclick="closeSkillModal()">
+  <div class="skill-modal" onclick="event.stopPropagation()">
+    <div class="skill-modal-header">
+      <span class="skill-modal-title" id="skill-modal-title"></span>
+      <button class="skill-modal-close" onclick="closeSkillModal()">&times;</button>
+    </div>
+    <div class="skill-modal-body" id="skill-modal-body"></div>
+  </div>
+</div>
+
 <script>
 /* ═══ Globals ═══ */
 const R = 15000;
@@ -1085,6 +1226,7 @@ function switchTab(name, btn) {
   if(name==='logs') loadLog(logTab);
   if(name==='pipeline') loadPipeline();
   if(name==='settings') loadSettings();
+  if(name==='skills') loadSkills();
 }
 
 /* ═══ Overview: Status ═══ */
@@ -1404,8 +1546,80 @@ async function previewFile(path,el) {
   } catch(e) { pv.innerHTML='<div class="preview-empty">Failed</div>'; }
 }
 
+/* ═══ Skills ═══ */
+let skillsData = [];
+async function loadSkills() {
+  try {
+    skillsData = await(await fetch('/api/skills')).json();
+    renderSkillsGrid();
+  } catch(e) { document.getElementById('skills-grid').textContent='Failed to load skills'; }
+}
+function renderSkillsGrid() {
+  const grid = document.getElementById('skills-grid');
+  if(!skillsData.length) { grid.innerHTML='<div style="color:var(--muted)">No skills installed</div>'; return; }
+  let h='';
+  for(let i=0;i<skillsData.length;i++) {
+    const s=skillsData[i];
+    const tags=[`<span class="skill-tag">${s.file_count} file${s.file_count!==1?'s':''}</span>`];
+    if(s.has_scripts) tags.push('<span class="skill-tag skill-tag-scripts">scripts</span>');
+    if(s.sections.length) tags.push(`<span class="skill-tag">${s.sections.length} sections</span>`);
+    h+=`<div class="skill-card" onclick="openSkillModal(${i})">
+      <div class="skill-card-name">${escHtml(s.name)}</div>
+      <div class="skill-card-desc">${escHtml(s.description)}</div>
+      <div class="skill-card-meta">${tags.join('')}</div>
+    </div>`;
+  }
+  grid.innerHTML=h;
+}
+function renderSkillBody(md) {
+  let body=md;
+  body=escHtml(body);
+  body=body.replace(/```(\w*)\n([\s\S]*?)```/g,'<pre><code>$2</code></pre>');
+  body=body.replace(/`([^`]+)`/g,'<code>$1</code>');
+  body=body.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+  body=body.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+  body=body.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+  body=body.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  body=body.replace(/\*(.+?)\*/g,'<em>$1</em>');
+  body=body.replace(/\|([^\n]+)\|/g, function(match){
+    const cells=match.split('|').filter(c=>c.trim());
+    if(cells.every(c=>/^[\s-:]+$/.test(c))) return '';
+    const isHeader=cells.every(c=>/\*\*/.test(c));
+    const tag=isHeader?'th':'td';
+    return '<tr>'+cells.map(c=>`<${tag}>${c.trim()}</${tag}>`).join('')+'</tr>';
+  });
+  body=body.replace(/(<tr>[\s\S]*?<\/tr>\s*)+/g,'<table>$&</table>');
+  body=body.replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>');
+  body=body.replace(/^- \*\*(.+?):\*\* (.+)$/gm,'<li><strong>$1:</strong> $2</li>');
+  body=body.replace(/^- (.+)$/gm,'<li>$1</li>');
+  body=body.replace(/(<li>[\s\S]*?<\/li>\s*)+/g,'<ul>$&</ul>');
+  body=body.replace(/^(\d+)\. (.+)$/gm,'<li>$2</li>');
+  body=body.replace(/\n\n/g,'</p><p>');
+  body='<p>'+body+'</p>';
+  body=body.replace(/<p>\s*<\/p>/g,'');
+  body=body.replace(/<p>\s*(<h[123]>)/g,'$1');
+  body=body.replace(/(<\/h[123]>)\s*<\/p>/g,'$1');
+  body=body.replace(/<p>\s*(<ul>)/g,'$1');
+  body=body.replace(/(<\/ul>)\s*<\/p>/g,'$1');
+  body=body.replace(/<p>\s*(<table>)/g,'$1');
+  body=body.replace(/(<\/table>)\s*<\/p>/g,'$1');
+  body=body.replace(/<p>\s*(<pre>)/g,'$1');
+  body=body.replace(/(<\/pre>)\s*<\/p>/g,'$1');
+  return body;
+}
+function openSkillModal(idx) {
+  const s=skillsData[idx];
+  document.getElementById('skill-modal-title').textContent=s.name;
+  document.getElementById('skill-modal-body').innerHTML=renderSkillBody(s.body);
+  document.getElementById('skill-modal-backdrop').classList.add('open');
+}
+function closeSkillModal() {
+  document.getElementById('skill-modal-backdrop').classList.remove('open');
+}
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSkillModal(); });
+
 /* ═══ Init ═══ */
-refresh(); loadSync(); loadPipeline();
+refresh(); loadSync(); loadPipeline(); loadSkills();
 setInterval(refresh, R);
 setInterval(loadSync, 60000);
 browseTo('');
@@ -1421,8 +1635,25 @@ async def dashboard() -> HTMLResponse:
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 
+def _kill_stale_port(port: int = 8765) -> None:
+    """Kill any existing process listening on the given port before startup."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", "-i", f":{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for pid_str in result.stdout.strip().split():
+            pid = int(pid_str)
+            if pid != os.getpid():
+                logger.info("Killing stale process %d on port %d", pid, port)
+                os.kill(pid, 9)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     import uvicorn
+    _kill_stale_port(8765)
     uvicorn.run(
         "src.dashboard.app:app",
         host="0.0.0.0",

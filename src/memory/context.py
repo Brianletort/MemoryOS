@@ -38,6 +38,42 @@ def _preview(content: str, max_chars: int = _MAX_PREVIEW_CHARS) -> str:
     return text
 
 
+def _meeting_preview(content: str, max_chars: int = 4000) -> str:
+    """Return a rich preview of meeting content preserving markdown structure."""
+    clean = _strip_frontmatter(content)
+    if not clean.strip():
+        return ""
+    if len(clean) <= max_chars:
+        return clean.strip()
+    return clean[:max_chars].rsplit("\n", 1)[0] + "\n\n... [truncated]"
+
+
+def _email_preview(content: str, max_chars: int = 200) -> str:
+    """Extract from/subject/body-snippet from an email markdown document."""
+    clean = _strip_frontmatter(content)
+    if not clean.strip():
+        return ""
+
+    from_line = ""
+    body_lines: list[str] = []
+    for ln in clean.splitlines():
+        lower = ln.strip().lower()
+        if lower.startswith("**from") or lower.startswith("from:"):
+            from_line = ln.strip()
+        elif ln.strip() and not ln.startswith("#") and not ln.startswith("---"):
+            body_lines.append(ln.strip())
+
+    parts: list[str] = []
+    if from_line:
+        parts.append(from_line)
+    body_text = " ".join(body_lines)
+    if body_text:
+        if len(body_text) > max_chars:
+            body_text = body_text[:max_chars].rsplit(" ", 1)[0] + "..."
+        parts.append(body_text)
+    return " | ".join(parts) if parts else ""
+
+
 def _write_if_changed(path: Path, content: str) -> bool:
     """Write file only if content actually changed. Returns True if written."""
     if path.exists():
@@ -66,6 +102,7 @@ def generate_context_files(
     _generate_this_week(index, out, now)
     _generate_recent_emails(index, out, now)
     _generate_upcoming(index, out, now)
+    _generate_core(vault, out, cfg, now)
 
     logger.info("Context files updated in %s", out)
 
@@ -87,10 +124,27 @@ def _generate_today(index: Any, out: Path, now: datetime) -> None:
     lines.append("")
     if meetings:
         for doc in meetings:
-            lines.append(f"- **{doc['title']}** — `{doc['path']}`")
-            p = _preview(doc["content"])
-            if p:
-                lines.append(f"  {p}")
+            title = doc["title"]
+            path = doc["path"]
+            content = doc.get("content", "")
+
+            if "calendar" in title.lower():
+                lines.append(f"### Calendar — `{path}`")
+                lines.append("")
+                preview = _meeting_preview(content, max_chars=4000)
+                if preview:
+                    lines.append(preview)
+            elif "audio" in title.lower():
+                lines.append(f"### Transcripts — `{path}`")
+                lines.append("")
+                preview = _meeting_preview(content, max_chars=4000)
+                if preview:
+                    lines.append(preview)
+            else:
+                lines.append(f"- **{title}** — `{path}`")
+                p = _preview(content)
+                if p:
+                    lines.append(f"  {p}")
     else:
         lines.append("*No meetings today.*")
     lines.append("")
@@ -101,6 +155,9 @@ def _generate_today(index: Any, out: Path, now: datetime) -> None:
     if emails:
         for doc in emails[:30]:
             lines.append(f"- **{doc['title']}** — `{doc['path']}`")
+            ep = _email_preview(doc.get("content", ""))
+            if ep:
+                lines.append(f"  {ep}")
     else:
         lines.append("*No emails today.*")
     lines.append("")
@@ -229,3 +286,47 @@ def _generate_upcoming(index: Any, out: Path, now: datetime) -> None:
         lines.append("")
 
     _write_if_changed(out / "upcoming.md", "\n".join(lines) + "\n")
+
+
+def _generate_core(vault: Path, out: Path, cfg: dict[str, Any], now: datetime) -> None:
+    """Concatenate pinned knowledge files into a single core.md context file."""
+    memory_cfg = cfg.get("memory", {})
+    pinned = memory_cfg.get("pinned_files", [])
+    if not pinned:
+        return
+
+    lines = [
+        "# Core Work Context",
+        "",
+        f"*Auto-generated at {now.strftime('%Y-%m-%d %H:%M')} from "
+        f"{len(pinned)} pinned knowledge files.*",
+        "",
+    ]
+
+    loaded = 0
+    for rel_path in pinned:
+        full = vault / rel_path
+        if not full.is_file():
+            continue
+        try:
+            raw = full.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        content = _strip_frontmatter(raw)
+        if not content.strip():
+            continue
+        lines.append(content.strip())
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        loaded += 1
+
+    if loaded == 0:
+        return
+
+    lines[2] = (
+        f"*Auto-generated at {now.strftime('%Y-%m-%d %H:%M')} from "
+        f"{loaded} pinned knowledge files.*"
+    )
+
+    _write_if_changed(out / "core.md", "\n".join(lines) + "\n")

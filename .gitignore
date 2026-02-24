@@ -4,6 +4,7 @@ config/config.yaml
 # State and runtime
 config/state.json
 config/memory.db
+config/memory.db-journal
 config/watchdog_state.json
 config/.graph_token_cache.bin
 config/.privacy_mode
@@ -17,6 +18,7 @@ scripts/migrate_to_letort.py
 
 # Environment
 .env
+.env.local
 
 # Python
 __pycache__/

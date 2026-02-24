@@ -4,6 +4,8 @@
 <dict>
     <key>Label</key>
     <string>com.memoryos.watchdog</string>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>ProgramArguments</key>
     <array>
         <string>{{VENV_PYTHON}}</string>
@@ -11,9 +13,9 @@
     </array>
     <key>WorkingDirectory</key>
     <string>{{REPO_DIR}}</string>
-    <key>StartInterval</key>
-    <integer>300</integer>
     <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
     <string>{{REPO_DIR}}/logs/watchdog.log</string>

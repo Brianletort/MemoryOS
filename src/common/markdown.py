@@ -83,6 +83,8 @@ def text_similarity(a: str, b: str) -> float:
 def write_markdown(path: Path, content: str) -> None:
     """Write markdown content to a file, creating parent directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        logger.debug("Overwriting existing file (%d bytes): %s", path.stat().st_size, path)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
     logger.debug("Wrote %d bytes to %s", len(content), path)

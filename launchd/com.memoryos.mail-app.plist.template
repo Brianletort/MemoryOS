@@ -4,10 +4,13 @@
 <dict>
     <key>Label</key>
     <string>com.memoryos.mail-app</string>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{VENV_PYTHON}}</string>
-        <string>{{REPO_DIR}}/src/extractors/mail_app_extractor.py</string>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>"{{VENV_PYTHON}}" "{{REPO_DIR}}/src/extractors/mail_app_extractor.py"</string>
     </array>
     <key>StartInterval</key>
     <integer>300</integer>

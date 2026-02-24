@@ -17,6 +17,7 @@ import argparse
 import logging
 import subprocess
 import sys
+import time as _time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -34,12 +35,35 @@ FIELD_SEP = "\x1e"
 RECORD_SEP = "\x1f"
 
 
+# ── Self-healing helpers ─────────────────────────────────────────────────────
+
+def _is_calendar_app_running() -> bool:
+    result = subprocess.run(
+        ["pgrep", "-f", "Calendar.app/Contents/MacOS/Calendar$"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _ensure_calendar_app() -> bool:
+    """Launch Calendar.app if not running. Returns True if a launch was needed."""
+    if _is_calendar_app_running():
+        return False
+    logger.warning("Calendar.app is not running — launching it")
+    subprocess.run(["open", "-g", "-j", "-a", "Calendar"], timeout=10, capture_output=True)
+    _time.sleep(10)
+    logger.info("Calendar.app launched")
+    return True
+
+
 # ── AppleScript helpers ──────────────────────────────────────────────────────
 
 def _run_osascript(script: str, *, timeout: int = 120) -> str:
+    wrapper = Path(__file__).resolve().parent.parent.parent / "scripts" / "osascript_wrapper.sh"
+    cmd = [str(wrapper), "-e", script] if wrapper.is_file() else ["osascript", "-e", script]
     try:
         result = subprocess.run(
-            ["osascript", "-e", script],
+            cmd,
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -51,7 +75,11 @@ def _run_osascript(script: str, *, timeout: int = 120) -> str:
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "execution error" in stderr:
-            logger.warning("AppleScript error: %s", stderr)
+            if "-600" in stderr:
+                logger.warning("Calendar.app not running — auto-launching")
+                _ensure_calendar_app()
+            else:
+                logger.warning("AppleScript error: %s", stderr)
             return ""
         raise RuntimeError(f"osascript failed (rc={result.returncode}): {stderr}")
     return result.stdout.strip()
@@ -67,7 +95,7 @@ def fetch_events(
     """Fetch calendar events via AppleScript for the given date range.
 
     Returns a list of dicts with keys: summary, start_date, start_time,
-    end_date, end_time, location, is_all_day.
+    end_date, end_time, location, is_all_day, attendees, organizer, notes.
     """
     start_str = start.strftime("%A, %B %d, %Y at %I:%M:%S %p")
     end_str = end.strftime("%A, %B %d, %Y at %I:%M:%S %p")
@@ -80,6 +108,8 @@ def fetch_events(
     cal_filters = "\n            ".join(cal_filter_lines)
 
     script = f'''
+tell application "Calendar" to launch
+delay 1
 tell application "Calendar"
     set fieldSep to ASCII character 30
     set recSep to ASCII character 31
@@ -112,7 +142,7 @@ tell application "Calendar"
                 try
                     if allday event of e then set allDay to "true"
                 end try
-                set output to output & summ & fieldSep & sDate & fieldSep & eDate & fieldSep & loc & fieldSep & allDay & recSep
+                set output to output & summ & fieldSep & sDate & fieldSep & eDate & fieldSep & loc & fieldSep & allDay & fieldSep & "" & fieldSep & "" & fieldSep & "" & recSep
             end repeat
         end try
     end repeat
@@ -135,6 +165,13 @@ end tell
         start_dt = _parse_applescript_date(fields[1].strip())
         end_dt = _parse_applescript_date(fields[2].strip())
 
+        raw_attendees = fields[5].strip() if len(fields) > 5 else ""
+        attendees = [
+            a.strip() for a in raw_attendees.split(",") if a.strip()
+        ]
+        raw_notes = fields[6].strip() if len(fields) > 6 else ""
+        organizer = fields[7].strip() if len(fields) > 7 else ""
+
         events.append({
             "summary": fields[0].strip(),
             "start_date": start_dt.strftime("%Y-%m-%d") if start_dt else "unknown",
@@ -143,6 +180,9 @@ end tell
             "end_time": end_dt.strftime("%H:%M") if end_dt else "??:??",
             "location": fields[3].strip() if len(fields) > 3 else "",
             "is_all_day": (fields[4].strip().lower() == "true") if len(fields) > 4 else False,
+            "attendees": attendees,
+            "organizer": organizer,
+            "notes": raw_notes,
         })
 
     return events
@@ -164,6 +204,99 @@ def _parse_applescript_date(date_str: str) -> datetime | None:
             continue
     logger.debug("Could not parse date: %s", date_str)
     return None
+
+
+def _enrich_with_attendees(
+    events: list[dict[str, Any]],
+    calendar_names: list[str],
+    date: datetime,
+) -> None:
+    """Fetch attendees for a single day's events (in-place update).
+
+    Runs a separate, targeted AppleScript for just one day to avoid the
+    performance penalty of fetching attendees across the full 21-day range.
+    """
+    start_str = date.replace(hour=0, minute=0).strftime("%A, %B %d, %Y at %I:%M:%S %p")
+    end_str = (date.replace(hour=23, minute=59, second=59)).strftime("%A, %B %d, %Y at %I:%M:%S %p")
+
+    cal_filter_lines = []
+    for name in calendar_names:
+        cal_filter_lines.append(
+            f'if name of c is "{name}" then set targetCals to targetCals & {{c}}'
+        )
+    cal_filters = "\n            ".join(cal_filter_lines)
+
+    script = f'''
+tell application "Calendar"
+    set fieldSep to ASCII character 30
+    set recSep to ASCII character 31
+    set output to ""
+    set startDate to date "{start_str}"
+    set endDate to date "{end_str}"
+
+    set targetCals to {{}}
+    repeat with c in every calendar
+        {cal_filters}
+    end repeat
+    if (count of targetCals) is 0 then set targetCals to every calendar
+
+    repeat with c in targetCals
+        try
+            set evts to (every event of c whose start date >= startDate and start date <= endDate)
+            repeat with e in evts
+                set summ to summary of e
+                set sTime to start date of e as string
+                set attendeeList to ""
+                try
+                    repeat with a in (attendees of e)
+                        try
+                            set attendeeList to attendeeList & display name of a & ", "
+                        end try
+                    end repeat
+                end try
+                set eventNotes to ""
+                try
+                    set eventNotes to description of e
+                    if eventNotes is missing value then set eventNotes to ""
+                end try
+                set output to output & summ & fieldSep & sTime & fieldSep & attendeeList & fieldSep & eventNotes & recSep
+            end repeat
+        end try
+    end repeat
+    return output
+end tell
+'''
+    raw = _run_osascript(script, timeout=60)
+    if not raw:
+        logger.info("Attendee enrichment returned no data for %s", date.strftime("%Y-%m-%d"))
+        return
+
+    lookup: dict[str, dict[str, str]] = {}
+    for record in raw.split(RECORD_SEP):
+        record = record.strip()
+        if not record:
+            continue
+        fields = record.split(FIELD_SEP)
+        if len(fields) < 2:
+            continue
+        summ = fields[0].strip()
+        att_str = fields[2].strip() if len(fields) > 2 else ""
+        notes = fields[3].strip() if len(fields) > 3 else ""
+        attendees = [a.strip() for a in att_str.split(",") if a.strip()]
+        lookup[summ] = {"attendees": attendees, "notes": notes}
+
+    enriched = 0
+    for ev in events:
+        info = lookup.get(ev.get("summary", ""))
+        if info:
+            if info["attendees"]:
+                ev["attendees"] = info["attendees"]
+            if info["notes"] and not ev.get("notes"):
+                ev["notes"] = info["notes"]
+            enriched += 1
+
+    if enriched:
+        logger.info("Enriched %d/%d events with attendees for %s", enriched, len(events), date.strftime("%Y-%m-%d"))
 
 
 # ── Markdown rendering ───────────────────────────────────────────────────────
@@ -196,6 +329,15 @@ def render_calendar_note(
 
         if ev.get("location"):
             parts.append(f"- **Location:** {ev['location']}")
+        if ev.get("organizer"):
+            parts.append(f"- **Organizer:** {ev['organizer']}")
+        if ev.get("attendees"):
+            parts.append(f"- **Attendees:** {', '.join(ev['attendees'])}")
+        if ev.get("notes"):
+            notes_text = ev["notes"][:500]
+            if len(ev["notes"]) > 500:
+                notes_text += "..."
+            parts.append(f"- **Notes:** {notes_text}")
 
         parts.append("")
 
@@ -212,6 +354,8 @@ def run(
     days_forward: int = 14,
 ) -> None:
     """Run the Calendar.app extractor."""
+    _ensure_calendar_app()
+
     state_path = cfg["state_file"]
     state = load_state(state_path)
 
@@ -252,8 +396,33 @@ def run(
             continue
         daily_events[date_str].append(ev)
 
+    for date_str in daily_events:
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict[str, Any]] = []
+        for ev in daily_events[date_str]:
+            key = (ev.get("summary", ""), ev.get("start_time", ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(ev)
+        if len(unique) < len(daily_events[date_str]):
+            logger.info(
+                "Deduped %d -> %d events for %s",
+                len(daily_events[date_str]), len(unique), date_str,
+            )
+        daily_events[date_str] = unique
+
+    today_str = now.strftime("%Y-%m-%d")
+    tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    enrich_dates = {today_str, tomorrow_str}
+
     for date_str in sorted(daily_events.keys()):
         events = sorted(daily_events[date_str], key=lambda e: e.get("start_time", ""))
+        if date_str in enrich_dates:
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                _enrich_with_attendees(events, calendar_names, dt)
+            except Exception:
+                logger.warning("Attendee enrichment failed for %s", date_str, exc_info=True)
         cal_content = render_calendar_note(date_str, events)
 
         parts = date_str.split("-")

@@ -296,15 +296,35 @@ def render_calendar_note(
 # ── Main extraction logic ───────────────────────────────────────────────────
 
 def _is_new_outlook() -> bool:
-    """Detect if Outlook is in 'New Outlook' mode (cloud-only, no local DB writes)."""
+    """Detect if Outlook is in 'New Outlook' mode (cloud-only, no local DB writes).
+
+    Uses two signals: the macOS defaults key (authoritative when present) and
+    DB staleness (fallback only when the defaults key is missing).
+    """
     try:
         result = subprocess.run(
             ["defaults", "read", "com.microsoft.Outlook", "IsRunningNewOutlook"],
             capture_output=True, text=True, timeout=5,
         )
-        return result.stdout.strip() == "1"
+        if result.returncode == 0:
+            return result.stdout.strip() == "1"
     except Exception:
-        return False
+        pass
+
+    # Key missing or command failed -- fall back to DB staleness heuristic
+    db = (
+        Path.home()
+        / "Library" / "Group Containers" / "UBF8T346G9.Office"
+        / "Outlook" / "Outlook 15 Profiles" / "Main Profile"
+        / "Data" / "Outlook.sqlite"
+    )
+    if db.is_file():
+        import time as _time
+
+        stale_seconds = _time.time() - db.stat().st_mtime
+        if stale_seconds > 48 * 3600:
+            return True
+    return False
 
 
 def run(cfg: dict[str, Any], *, dry_run: bool = False, backfill: bool = False) -> None:

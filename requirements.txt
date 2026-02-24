@@ -8,3 +8,7 @@ fastapi>=0.115
 uvicorn>=0.34
 msal>=1.28
 requests>=2.31
+litellm>=1.50
+openai>=1.60
+duckduckgo-search>=7.0
+markdown>=3.5

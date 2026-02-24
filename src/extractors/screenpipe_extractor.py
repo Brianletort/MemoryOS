@@ -24,6 +24,7 @@ import argparse
 import logging
 import re
 import sqlite3
+import subprocess
 import sys
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
@@ -74,6 +75,34 @@ SELECT at.id,
 FROM audio_transcriptions at
 LEFT JOIN speakers s ON at.speaker_id = s.id
 WHERE at.id > ?
+ORDER BY at.timestamp ASC
+"""
+
+QUERY_OCR_BY_DATE = """
+SELECT f.id AS frame_id,
+       f.timestamp,
+       COALESCE(f.app_name, '') AS app_name,
+       COALESCE(f.window_name, '') AS window_name,
+       COALESCE(f.browser_url, '') AS browser_url,
+       o.text,
+       COALESCE(o.focused, 0) AS focused
+FROM frames f
+JOIN ocr_text o ON o.frame_id = f.id
+WHERE date(f.timestamp) = ?
+ORDER BY f.timestamp ASC
+"""
+
+QUERY_AUDIO_BY_DATE = """
+SELECT at.id,
+       at.timestamp,
+       at.transcription,
+       COALESCE(at.device, '') AS device,
+       COALESCE(at.is_input_device, 1) AS is_input_device,
+       at.speaker_id,
+       s.name AS speaker_name
+FROM audio_transcriptions at
+LEFT JOIN speakers s ON at.speaker_id = s.id
+WHERE date(at.timestamp) = ?
 ORDER BY at.timestamp ASC
 """
 
@@ -365,18 +394,27 @@ def match_audio_to_meetings(
     Returns (matched_meetings, uncorrelated) where each matched meeting
     contains a time range string, title, and list of audio entries whose
     timestamps fall within the event window (expanded by buffer_minutes).
+
+    When multiple events overlap, the narrowest (shortest duration) event
+    wins so that specific meetings are preferred over broad blocks like
+    "out of office" or all-day holds.
     """
     if not events:
         return [], list(audio_entries)
 
     buf = timedelta(minutes=buffer_minutes)
 
+    indexed_events = sorted(
+        enumerate(events),
+        key=lambda ie: (ie[1].end - ie[1].start),
+    )
+
     buckets: dict[int, list[AudioEntry]] = defaultdict(list)
     uncorrelated: list[AudioEntry] = []
 
     for ae in audio_entries:
         placed = False
-        for idx, ev in enumerate(events):
+        for idx, ev in indexed_events:
             if (ev.start - buf) <= ae.timestamp <= (ev.end + buf):
                 buckets[idx].append(ae)
                 placed = True
@@ -594,6 +632,208 @@ def _format_speaker(ae: AudioEntry) -> str:
     return f"Speaker {ae.speaker_id or '?'}"
 
 
+# ── Self-healing helpers ─────────────────────────────────────────────────────
+
+import json as _json
+import time as _time
+import urllib.request as _urllib_request
+
+_HEAL_STATE_FILE = Path(__file__).resolve().parent.parent.parent / "config" / "heal_screenpipe.json"
+SCREENPIPE_STALE_SECONDS: int = 1800
+MAX_FRAME_DROP_RATE: float = 0.95
+RESTART_COOLDOWN: int = 600  # 10 min (was 30 min)
+CONSECUTIVE_FAILURES_BEFORE_RESTART: int = 3
+
+
+def _load_heal_state() -> dict[str, Any]:
+    if _HEAL_STATE_FILE.is_file():
+        try:
+            return _json.loads(_HEAL_STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_heal_state(state: dict[str, Any]) -> None:
+    _HEAL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _HEAL_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(state, indent=2, default=str))
+    tmp.rename(_HEAL_STATE_FILE)
+
+
+def _is_screenpipe_running() -> bool:
+    result = subprocess.run(
+        ["pgrep", "-f", "screenpipe-app"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _restart_screenpipe(reason: str) -> None:
+    """Kill and relaunch Screenpipe."""
+    logger.warning("Restarting Screenpipe — %s", reason)
+    subprocess.run(["pkill", "-f", "screenpipe-app"], timeout=10, capture_output=True)
+    _time.sleep(5)
+    subprocess.run(["open", "-a", "screenpipe"], timeout=10, capture_output=True)
+    _time.sleep(10)
+    hs = _load_heal_state()
+    hs["consecutive_no_data"] = 0
+    hs["consecutive_degraded"] = 0
+    hs["last_restart_epoch"] = _time.time()
+    hs["last_restart_reason"] = reason
+    _save_heal_state(hs)
+    logger.info("Screenpipe restarted")
+
+
+def _can_restart() -> bool:
+    hs = _load_heal_state()
+    return (_time.time() - hs.get("last_restart_epoch", 0)) > RESTART_COOLDOWN
+
+
+def _query_screenpipe_health() -> dict[str, Any] | None:
+    """Query the Screenpipe health API at localhost:3030."""
+    try:
+        req = _urllib_request.Request("http://localhost:3030/health", method="GET")
+        with _urllib_request.urlopen(req, timeout=5) as resp:
+            return _json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _screenpipe_post(path: str, body: dict[str, Any]) -> bool:
+    """POST JSON to a Screenpipe API endpoint."""
+    url = f"http://localhost:3030{path}"
+    data = _json.dumps(body).encode()
+    req = _urllib_request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _cycle_audio_devices() -> None:
+    """Stop and restart all active audio devices via the Screenpipe API."""
+    try:
+        req = _urllib_request.Request("http://localhost:3030/audio/list", method="GET")
+        with _urllib_request.urlopen(req, timeout=5) as resp:
+            devices = _json.loads(resp.read())
+    except Exception:
+        logger.warning("Cannot list audio devices — Screenpipe API unreachable")
+        return
+
+    cycled = 0
+    for dev in devices:
+        name = dev.get("name", "")
+        if not name:
+            continue
+        _screenpipe_post("/audio/device/stop", {"device_name": name})
+        _time.sleep(1)
+        _screenpipe_post("/audio/device/start", {"device_name": name})
+        _time.sleep(1)
+        cycled += 1
+
+    logger.info("Cycled %d audio devices to reset VAD state", cycled)
+
+
+AUDIO_STALE_CYCLES: int = 2  # 2 cycles * 5 min = 10 min of silence triggers reset
+AUDIO_CYCLE_COOLDOWN: int = 600  # 10 min (was 30 min)
+
+
+def _is_work_hours() -> bool:
+    """Return True if current local time is within work hours (7 AM - 7 PM)."""
+    hour = datetime.now().hour
+    return 7 <= hour < 19
+
+
+def _check_audio_staleness(had_audio: bool) -> None:
+    """Track consecutive no-audio cycles and cycle devices if stale during work hours."""
+    hs = _load_heal_state()
+
+    if had_audio:
+        if hs.get("consecutive_no_audio", 0) > 0:
+            hs["consecutive_no_audio"] = 0
+            _save_heal_state(hs)
+        return
+
+    if not _is_work_hours():
+        return
+
+    no_audio = hs.get("consecutive_no_audio", 0) + 1
+    hs["consecutive_no_audio"] = no_audio
+    _save_heal_state(hs)
+
+    if no_audio >= AUDIO_STALE_CYCLES:
+        last_cycle = hs.get("last_audio_cycle_epoch", 0)
+        if (_time.time() - last_cycle) > AUDIO_CYCLE_COOLDOWN:
+            logger.warning(
+                "No audio for %d consecutive cycles during work hours — "
+                "cycling audio devices", no_audio,
+            )
+            _cycle_audio_devices()
+            hs["consecutive_no_audio"] = 0
+            hs["last_audio_cycle_epoch"] = _time.time()
+            _save_heal_state(hs)
+
+
+def _check_screenpipe_health(db_path: str) -> None:
+    """Check multiple health signals and restart Screenpipe if needed."""
+    hs = _load_heal_state()
+
+    # Signal 1: Is the app running at all?
+    if not _is_screenpipe_running():
+        logger.warning("Screenpipe not running — launching")
+        subprocess.run(["open", "-a", "screenpipe"], timeout=10, capture_output=True)
+        _time.sleep(10)
+        return
+
+    # Signal 2: Health API check (frame drops, stalls)
+    health = _query_screenpipe_health()
+    if health:
+        pipeline = health.get("pipeline", {})
+        drop_rate = pipeline.get("frame_drop_rate", 0)
+        stall_count = pipeline.get("pipeline_stall_count", 0)
+        frame_status = health.get("frame_status", "unknown")
+        audio_status = health.get("audio_status", "unknown")
+
+        if frame_status == "stale" and drop_rate > MAX_FRAME_DROP_RATE:
+            degraded_count = hs.get("consecutive_degraded", 0) + 1
+            hs["consecutive_degraded"] = degraded_count
+            _save_heal_state(hs)
+            logger.warning(
+                "Screenpipe degraded: %.0f%% frame drop, %d stalls "
+                "[consecutive_degraded=%d/%d]",
+                drop_rate * 100, stall_count,
+                degraded_count, CONSECUTIVE_FAILURES_BEFORE_RESTART,
+            )
+            if degraded_count >= CONSECUTIVE_FAILURES_BEFORE_RESTART and _can_restart():
+                _restart_screenpipe(
+                    f"persistent frame drops ({drop_rate:.0%}) "
+                    f"with {stall_count} stalls"
+                )
+                return
+        else:
+            if hs.get("consecutive_degraded", 0) > 0:
+                hs["consecutive_degraded"] = 0
+                _save_heal_state(hs)
+
+    # Signal 3: DB staleness (no new data written)
+    db = Path(db_path)
+    if not db.is_file():
+        return
+
+    stale_seconds = _time.time() - db.stat().st_mtime
+    no_data_count = hs.get("consecutive_no_data", 0)
+
+    if stale_seconds > SCREENPIPE_STALE_SECONDS and no_data_count >= CONSECUTIVE_FAILURES_BEFORE_RESTART:
+        if _can_restart():
+            _restart_screenpipe(
+                f"DB stale for {stale_seconds / 60:.0f}m, "
+                f"{no_data_count} cycles with no data"
+            )
+
+
 # ── Main extraction logic ───────────────────────────────────────────────────
 
 def _date_to_path(date_str: str) -> str:
@@ -613,6 +853,7 @@ def run(cfg: dict[str, Any], *, dry_run: bool = False) -> None:
     db_path = cfg["screenpipe"]["db_path"]
     if not Path(db_path).is_file():
         logger.error("Screenpipe DB not found: %s", db_path)
+        _check_screenpipe_health(db_path)
         return
 
     state_path = cfg["state_file"]
@@ -627,25 +868,59 @@ def run(cfg: dict[str, Any], *, dry_run: bool = False) -> None:
     try:
         ocr_rows = conn.execute(QUERY_OCR, (last_frame_id,)).fetchall()
         audio_rows = conn.execute(QUERY_AUDIO, (last_audio_id,)).fetchall()
+
+        if not ocr_rows and not audio_rows:
+            logger.info("No new Screenpipe data")
+            hs = _load_heal_state()
+            hs["consecutive_no_data"] = hs.get("consecutive_no_data", 0) + 1
+            _save_heal_state(hs)
+            _check_audio_staleness(had_audio=False)
+            _check_screenpipe_health(db_path)
+            return
+
+        _check_audio_staleness(had_audio=bool(audio_rows))
+
+        # Reset no-data counter on success
+        hs = _load_heal_state()
+        if hs.get("consecutive_no_data", 0) > 0:
+            hs["consecutive_no_data"] = 0
+            _save_heal_state(hs)
+
+        max_frame_id = max((r[0] for r in ocr_rows), default=last_frame_id)
+        max_audio_id = max((r[0] for r in audio_rows), default=last_audio_id)
+
+        logger.info("Found %d new OCR entries, %d new audio entries", len(ocr_rows), len(audio_rows))
+
+        # Determine which dates were affected by new entries
+        affected_dates: set[str] = set()
+        for r in ocr_rows:
+            affected_dates.add(_parse_ts(r[1]).strftime("%Y-%m-%d"))
+        for r in audio_rows:
+            affected_dates.add(_parse_ts(r[1]).strftime("%Y-%m-%d"))
+
+        # Re-query ALL entries for affected dates so writes contain complete data
+        all_ocr_entries: list[OcrEntry] = []
+        all_audio_entries: list[AudioEntry] = []
+        for date_str in affected_dates:
+            for r in conn.execute(QUERY_OCR_BY_DATE, (date_str,)).fetchall():
+                all_ocr_entries.append(OcrEntry(r))
+            for r in conn.execute(QUERY_AUDIO_BY_DATE, (date_str,)).fetchall():
+                all_audio_entries.append(AudioEntry(r))
+
+        logger.info(
+            "Loaded full-day data for %d date(s): %d OCR, %d audio entries",
+            len(affected_dates), len(all_ocr_entries), len(all_audio_entries),
+        )
     finally:
         conn.close()
 
-    if not ocr_rows and not audio_rows:
-        logger.info("No new Screenpipe data")
-        return
+    ocr_entries = all_ocr_entries
+    audio_entries = all_audio_entries
 
-    logger.info("Found %d new OCR entries, %d new audio entries", len(ocr_rows), len(audio_rows))
-
-    # Parse
-    ocr_entries = [OcrEntry(r) for r in ocr_rows]
-    audio_entries = [AudioEntry(r) for r in audio_rows]
-
-    # Dedup OCR and audio
     threshold = cfg.get("screenpipe_settings", {}).get("dedup_threshold", 0.85)
     ocr_entries = deduplicate_ocr(ocr_entries, threshold)
     audio_entries = deduplicate_audio(audio_entries, threshold)
 
-    # ── Audio noise filtering ──
     filter_result = filter_audio_entries(audio_entries, ocr_entries, cfg)
     audio_kept = filter_result.kept
     audio_filtered = filter_result.filtered
@@ -662,16 +937,11 @@ def run(cfg: dict[str, Any], *, dry_run: bool = False) -> None:
     for e in teams_ocr:
         teams_by_date[e.timestamp.strftime("%Y-%m-%d")].append(e)
 
-    # Collect all dates across OCR and audio (both kept and filtered)
     all_dates = (
         set(ocr_grouped.keys())
         | set(audio_kept_grouped.keys())
         | set(audio_filtered_grouped.keys())
     )
-
-    # Track max IDs for cursor update
-    max_frame_id = max((e.frame_id for e in [OcrEntry(r) for r in ocr_rows]), default=last_frame_id)
-    max_audio_id = max((e.audio_id for e in [AudioEntry(r) for r in audio_rows]), default=last_audio_id)
 
     activity_dir = resolve_output_dir(cfg, "activity")
     teams_dir = resolve_output_dir(cfg, "teams")

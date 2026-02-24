@@ -19,6 +19,7 @@ import logging
 import re
 import subprocess
 import sys
+import time as _time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,33 +36,117 @@ logger = logging.getLogger("memoryos.mail_app")
 FIELD_SEP = "\x1e"  # ASCII record separator -- won't appear in email fields
 RECORD_SEP = "\x1f"  # ASCII unit separator -- delimits messages
 
+MAX_TIMEOUTS_BEFORE_RESTART: int = 3
+_HEAL_STATE_FILE = Path(__file__).resolve().parent.parent.parent / "config" / "heal_mail.json"
+
+
+# ── Self-healing helpers ─────────────────────────────────────────────────────
+
+def _load_heal_state() -> dict[str, Any]:
+    if _HEAL_STATE_FILE.is_file():
+        try:
+            import json
+            return json.loads(_HEAL_STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_heal_state(state: dict[str, Any]) -> None:
+    import json
+    _HEAL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _HEAL_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str))
+    tmp.rename(_HEAL_STATE_FILE)
+
+
+def _get_timeout_count() -> int:
+    return _load_heal_state().get("consecutive_timeouts", 0)
+
+
+def _set_timeout_count(n: int) -> None:
+    hs = _load_heal_state()
+    hs["consecutive_timeouts"] = n
+    hs["last_updated"] = datetime.now().isoformat()
+    _save_heal_state(hs)
+
+
+def _is_mail_app_running() -> bool:
+    result = subprocess.run(
+        ["pgrep", "-f", "Mail.app/Contents/MacOS/Mail$"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _ensure_mail_app() -> bool:
+    """Launch Mail.app if it is not running. Returns True if a launch was needed."""
+    if _is_mail_app_running():
+        return False
+    logger.warning("Mail.app is not running — launching it")
+    subprocess.run(["open", "-g", "-j", "-a", "Mail"], timeout=10, capture_output=True)
+    _time.sleep(20)
+    logger.info("Mail.app launched")
+    return True
+
+
+def _restart_mail_app(reason: str) -> None:
+    """Force-quit and reopen Mail.app to clear a hung state."""
+    count = _get_timeout_count()
+    logger.warning("Restarting Mail.app (%s, %d consecutive timeouts)", reason, count)
+    subprocess.run(
+        ["pkill", "-f", "Mail.app/Contents/MacOS/Mail"],
+        timeout=10, capture_output=True,
+    )
+    _time.sleep(5)
+    subprocess.run(["open", "-g", "-j", "-a", "Mail"], timeout=10, capture_output=True)
+    _time.sleep(20)
+    _set_timeout_count(0)
+    logger.info("Mail.app restarted — next extraction cycle should succeed")
+
 
 # ── AppleScript helpers ──────────────────────────────────────────────────────
 
 def _run_osascript(script: str, *, timeout: int = 120) -> str:
     """Execute an AppleScript via osascript and return stdout."""
+    wrapper = Path(__file__).resolve().parent.parent.parent / "scripts" / "osascript_wrapper.sh"
+    cmd = [str(wrapper), "-e", script] if wrapper.is_file() else ["osascript", "-e", script]
     try:
         result = subprocess.run(
-            ["osascript", "-e", script],
+            cmd,
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        count = _get_timeout_count() + 1
+        _set_timeout_count(count)
         logger.warning(
-            "AppleScript timed out after %ds (Mail.app may still be syncing)", timeout,
+            "AppleScript timed out after %ds [consecutive_timeouts=%d/%d]",
+            timeout, count, MAX_TIMEOUTS_BEFORE_RESTART,
         )
+        if count >= MAX_TIMEOUTS_BEFORE_RESTART:
+            _restart_mail_app("subprocess timeout")
         return ""
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "execution error" in stderr:
             if "-1712" in stderr:
+                count = _get_timeout_count() + 1
+                _set_timeout_count(count)
                 logger.warning(
-                    "Mail.app AppleEvent timed out (busy syncing). "
-                    "Will retry next cycle."
+                    "Mail.app AppleEvent timed out (busy syncing) "
+                    "[consecutive_timeouts=%d/%d]",
+                    count, MAX_TIMEOUTS_BEFORE_RESTART,
                 )
+                if count >= MAX_TIMEOUTS_BEFORE_RESTART:
+                    _restart_mail_app("AppleEvent -1712")
+            elif "-600" in stderr:
+                logger.warning("Mail.app not running — auto-launching")
+                _ensure_mail_app()
             else:
                 logger.warning("AppleScript error: %s", stderr)
             return ""
         raise RuntimeError(f"osascript failed (rc={result.returncode}): {stderr}")
+    _set_timeout_count(0)
     return result.stdout.strip()
 
 
@@ -352,6 +437,8 @@ def run(
     days_back: int | None = None,
 ) -> None:
     """Run the Mail.app email extractor."""
+    _ensure_mail_app()
+
     state_path = cfg["state_file"]
     state = load_state(state_path)
 

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memoryos.team-manager</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{VENV_PYTHON}}</string>
+        <string>-m</string>
+        <string>src.agents.skill_runner</string>
+        <string>--skill</string>
+        <string>team-manager</string>
+        <string>--email</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{REPO_DIR}}</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>25</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{{REPO_DIR}}/logs/team-manager.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{REPO_DIR}}/logs/team-manager.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>{{REPO_DIR}}</string>
+    </dict>
+</dict>
+</plist>

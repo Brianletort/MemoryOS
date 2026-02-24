@@ -39,119 +39,107 @@ python3 src/monitor/watchdog.py --status
 
 The dashboard also exposes watchdog status at `GET /api/watchdog`.
 
-## Prerequisites
+## Quick Start
 
-You need a Mac running macOS 13+ (Ventura or later). Everything runs locally.
-
-### Required
-
-1. **Homebrew** -- macOS package manager
-
-   ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-
-2. **Python 3.9+**
-
-   ```bash
-   brew install python@3.12
-   ```
-
-3. **Screenpipe** -- screen recording + audio transcription engine
-
-   Install from [screenpipe.com](https://screenpipe.com) or:
-   ```bash
-   brew install screenpipe
-   ```
-   Screenpipe must be running for screen/audio capture to work. It creates a local SQLite database at `~/.screenpipe/db.sqlite`.
-
-4. **Obsidian** -- knowledge base where all Markdown output lands
-
-   Download from [obsidian.md](https://obsidian.md). Create a new vault or point MemoryOS at an existing one.
-
-5. **pandoc** -- converts Word documents to Markdown
-
-   ```bash
-   brew install pandoc
-   ```
-
-### Optional
-
-6. **BlackHole 2ch** -- virtual audio driver for capturing meeting audio (other participants' voices, not just yours)
-
-   ```bash
-   brew install blackhole-2ch
-   ```
-
-   After installing, configure the audio routing:
-   1. Open **Audio MIDI Setup** (search in Spotlight)
-   2. Click **+** at bottom left, select **Create Multi-Output Device**
-   3. Check both your speakers (e.g. "MacBook Pro Speakers") and **BlackHole 2ch**
-   4. Go to **System Settings > Sound > Output** and select the new **Multi-Output Device**
-   5. In Screenpipe settings, add **BlackHole 2ch** as an input audio device
-
-   This routes system audio (Zoom, Teams, etc.) through BlackHole so Screenpipe can transcribe it.
-
-7. **Microsoft Graph API** -- for richer email/calendar data from Microsoft 365
-
-   If you use Outlook or Microsoft 365 and want full HTML email bodies and detailed calendar data, you can connect via the Graph API. This requires registering an Azure AD application:
-
-   1. Go to [Azure Portal > App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
-   2. Click **New registration**
-   3. Name: `MemoryOS` (or anything you like)
-   4. Supported account types: **Accounts in any organizational directory and personal Microsoft accounts**
-   5. Redirect URI: leave blank (we use device code flow)
-   6. After creation, copy the **Application (client) ID**
-   7. Go to **API permissions > Add a permission > Microsoft Graph > Delegated permissions**
-   8. Add: `Mail.Read`, `Calendars.Read`
-   9. Paste the client ID into `config/config.yaml` under `graph.client_id`
-
-   If you don't need Graph API, skip this. Mail.app and Calendar.app work out of the box with zero configuration.
-
-## Installation
+You need a Mac running macOS 13+ (Ventura or later). The installer handles everything else.
 
 ```bash
-git clone https://github.com/Brianletort/MemoryOS.git
-cd MemoryOS
-./scripts/setup.sh
+git clone https://github.com/Brianletort/MemoryOS.git ~/.memoryos
+cd ~/.memoryos
+./install.sh
 ```
 
-The setup script will:
-- Create a Python virtual environment
-- Install all Python dependencies
-- Install system dependencies via Homebrew
-- Create `config/config.yaml` from the template
+The installer will:
+1. Install system dependencies (Homebrew, Python 3.12, pandoc)
+2. Create a Python virtual environment and install all packages
+3. Open the **Setup Wizard** in your browser at http://localhost:8765
+
+The Setup Wizard walks you through:
+- **Dependencies** -- verifies everything is installed
+- **Configure** -- set your Obsidian vault path, email source, calendar source
+- **AI Agents** -- pick your LLM provider (OpenAI, Anthropic, Gemini, Ollama) and enter your API key
+- **Activate** -- installs background agents, runs your first extraction, builds the search index
+
+After the wizard completes, MemoryOS runs automatically in the background. Data starts flowing into your vault within minutes.
+
+### macOS Permissions
+
+After setup, grant Full Disk Access to Python so email and calendar extraction runs without popups:
+
+```bash
+./scripts/grant_permissions.sh
+```
+
+This opens the correct System Settings pane and tells you exactly what to click.
+
+### Managing MemoryOS
+
+```bash
+./scripts/memoryos start       # Start all background agents
+./scripts/memoryos stop        # Stop all background agents
+./scripts/memoryos status      # Show what's running
+./scripts/memoryos doctor      # Full health check
+./scripts/memoryos logs        # Tail the combined log
+./scripts/memoryos update      # Pull latest code and reinstall
+./scripts/memoryos uninstall   # Remove all agents (keeps your data)
+```
+
+## Voice & Screen Capture (Optional)
+
+MemoryOS captures email, calendar, documents, and Teams chat out of the box. For **screen activity** (OCR) and **voice transcription** from meetings, you need a separate capture tool:
+
+- **[Screenpipe](https://screenpipe.com)** -- open-source screen + audio capture. Install from screenpipe.com or `brew install screenpipe`.
+- **Scribe** -- alternative capture tool with the same Obsidian output format.
+
+Both write structured Markdown into your Obsidian vault. MemoryOS picks up whatever they produce. Without a capture tool, everything else still works -- you just won't have screen activity or meeting transcripts.
+
+The Setup Wizard checks for Screenpipe automatically and shows its status.
+
+## Prerequisites (Detail)
+
+The installer handles all of these, but for reference:
+
+| Dependency | Installed by | Purpose |
+|------------|-------------|---------|
+| Homebrew | `install.sh` | macOS package manager |
+| Python 3.9+ | `install.sh` via Homebrew | Runtime |
+| pandoc | `install.sh` via Homebrew | Document conversion (docx/pptx to Markdown) |
+| BlackHole 2ch | `install.sh` via Homebrew | Virtual audio driver for meeting capture (optional) |
+| Obsidian | User installs | Knowledge base UI ([obsidian.md](https://obsidian.md)) |
+| Screenpipe or Scribe | User installs | Screen OCR + voice transcription (optional) |
+
+### Microsoft Graph API (Optional)
+
+If you use Microsoft 365 and want richer email/calendar data (full HTML bodies, detailed events), you can connect via the Graph API. This requires an Azure AD app registration:
+
+1. Go to [Azure Portal > App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
+2. Click **New registration**, name it `MemoryOS`
+3. Supported account types: **Accounts in any organizational directory and personal Microsoft accounts**
+4. Redirect URI: leave blank (device code flow)
+5. Copy the **Application (client) ID** and enter it in the Setup Wizard
+
+If you don't need Graph API, skip this entirely. Mail.app and Calendar.app work out of the box.
 
 ## Configuration
 
-Edit `config/config.yaml` with your paths:
+The Setup Wizard creates `config/config.yaml` and `.env.local` for you. To edit them manually:
 
 ```bash
-$EDITOR config/config.yaml
-```
-
-At minimum, set:
-
-```yaml
-# REQUIRED: path to your Obsidian vault
-obsidian_vault: ~/Documents/Obsidian/MyVault
-
-# Screenpipe database (usually auto-detected)
-screenpipe:
-  db_path: ~/.screenpipe/db.sqlite
+$EDITOR config/config.yaml    # Paths, email source, privacy settings
+$EDITOR .env.local             # API keys (never committed to git)
 ```
 
 ### Email & Calendar -- Pick Your Path
 
-**Easy path** (recommended to start): macOS Mail.app + Calendar.app. If your email accounts are configured in **System Settings > Internet Accounts**, you're done. The default config works out of the box.
+**Easy path** (default): macOS Mail.app + Calendar.app. If your email accounts are configured in **System Settings > Internet Accounts**, you're done.
 
-**Power path**: Microsoft Graph API. Set `graph.client_id` to your Azure app's client ID (see Prerequisites step 7). Gives you full email HTML bodies and detailed calendar event data.
+**Outlook Classic**: If you use Outlook for Mac in Classic mode (not "New Outlook"), select Outlook in the Setup Wizard. **Note:** "New Outlook" uses cloud-only storage -- the extractor auto-detects this and falls back to Mail.app.
 
-**Outlook Classic**: If you use Outlook for Mac in Classic mode (not "New Outlook"), set `outlook.db_path` to your Outlook SQLite database path. **Note:** The "New Outlook" for Mac uses cloud-only storage and does not write to the local SQLite DB. The Outlook extractor auto-detects this and falls back to the mail_app extractor.
+**Microsoft Graph API**: For full HTML email bodies and detailed calendar data from M365. Requires Azure AD app registration (see above).
 
-### OneDrive (optional)
+### OneDrive (Optional)
 
-Set `onedrive.sync_dir` to your OneDrive sync folder to automatically convert documents to searchable Markdown.
+Set your OneDrive sync folder in the Setup Wizard to automatically convert documents (docx, pptx, pdf, xlsx) to searchable Markdown.
 
 ### Environment Variable Overrides
 
@@ -166,15 +154,27 @@ Any config path can be overridden via environment variables:
 | `MEMORYOS_STATE_FILE` | `state_file` |
 | `MEMORYOS_LOG_DIR` | `log_dir` |
 
-## Getting Started
+## Background Agents
 
-### 1. Run the smoke test
+After activation, these launchd agents run automatically:
 
-```bash
-./scripts/smoke_test.sh
-```
+| Agent | Interval | Purpose |
+|-------|----------|---------|
+| `com.memoryos.screenpipe` | 5 min | Screen OCR + audio transcription extraction |
+| `com.memoryos.mail-app` | 5 min | Email from Mail.app via AppleScript |
+| `com.memoryos.calendar-app` | 5 min | Calendar from Calendar.app via AppleScript |
+| `com.memoryos.outlook` | 5 min | Email + calendar from Outlook Classic DB |
+| `com.memoryos.onedrive` | 15 min | Document conversion (docx, pptx, pdf, xlsx) |
+| `com.memoryos.indexer` | 5 min | Full-text search index + context file generation |
+| `com.memoryos.dashboard` | Continuous | Web dashboard on port 8765 |
+| `com.memoryos.watchdog` | Continuous | Health monitoring with macOS notifications |
+| `com.memoryos.wifi-monitor` | 60 sec | WiFi-based auto-privacy mode |
+| `com.memoryos.morning-brief` | Daily 4 AM | AI morning briefing |
+| `com.memoryos.weekly-status` | Weekly | AI weekly status report |
+| `com.memoryos.commitment-tracker` | Scheduled | Track action items and follow-ups |
+| `com.memoryos.news-pulse` | Scheduled | Curated industry news briefing |
 
-### 2. Run extractors manually to see output
+### Running Extractors Manually
 
 ```bash
 # Screen activity + audio transcription
@@ -193,37 +193,9 @@ python3 src/extractors/onedrive_extractor.py
 
 All extractors support `--dry-run` to preview output without writing files.
 
-### 3. Build the memory index
+### Initial Backfill (Optional)
 
-```bash
-python3 -m src.memory.cli reindex
-```
-
-This scans your vault and builds a SQLite full-text search index. It also generates context files in `_context/` for AI tools.
-
-### 4. Install automation
-
-```bash
-./scripts/install_launchd.sh
-```
-
-This installs 9 macOS launchd agents:
-
-| Agent | Interval | Purpose |
-|-------|----------|---------|
-| `com.memoryos.screenpipe` | 5 min | Screen OCR + audio transcription extraction |
-| `com.memoryos.outlook` | 5 min | Email + calendar from Outlook Classic DB |
-| `com.memoryos.mail-app` | 5 min | Email from Mail.app via AppleScript |
-| `com.memoryos.calendar-app` | 5 min | Calendar from Calendar.app via AppleScript |
-| `com.memoryos.onedrive` | 15 min | Document conversion (docx, pptx, pdf, xlsx) |
-| `com.memoryos.indexer` | 5 min | Full-text search index + context file generation |
-| `com.memoryos.dashboard` | Continuous | Web dashboard on port 8765 |
-| `com.memoryos.watchdog` | 5 min | Health monitoring with macOS notifications |
-| `com.memoryos.wifi-monitor` | Continuous | WiFi-based auto-privacy mode |
-
-### 5. Optional: initial backfill
-
-If you have existing email history you want to import:
+Import existing email history:
 
 ```bash
 # Outlook Classic: import all emails (may take several minutes)
@@ -232,7 +204,7 @@ python3 src/extractors/outlook_extractor.py --backfill
 # Mail.app: import last year
 python3 src/extractors/mail_app_extractor.py --days-back 365
 
-# After backfill, rebuild the index
+# Rebuild the index after backfill
 python3 -m src.memory.cli reindex --full
 ```
 
@@ -465,8 +437,11 @@ python3 src/monitor/watchdog.py             # Check health and notify on changes
 
 ```
 MemoryOS/
+├── install.sh                    # Single-command installer (start here)
+├── .env.example                  # Environment variable template
+├── requirements.txt              # Python dependencies
 ├── config/
-│   ├── config.yaml.example       # Template (committed)
+│   ├── config.yaml.example       # Config template (committed)
 │   ├── config.yaml               # Your personal config (gitignored)
 │   ├── state.json                # Extractor cursors (gitignored)
 │   ├── memory.db                 # SQLite FTS5 index (gitignored)
@@ -489,19 +464,23 @@ MemoryOS/
 │   │   ├── tier.py               # Hot/warm/cold classification
 │   │   ├── context.py            # Context file generator
 │   │   └── cli.py                # Command-line interface
+│   ├── agents/                   # AI agent system
+│   │   ├── skill_runner.py       # Headless skill execution (morning brief, etc.)
+│   │   ├── agent_loop.py         # Agentic chat with auto-RAG + tool loop
+│   │   ├── tools.py              # Agent tools (search, vault, email, web)
+│   │   └── llm_provider.py       # LLM abstraction (OpenAI, Anthropic, etc.)
 │   ├── monitor/                  # System health monitoring
 │   │   └── watchdog.py           # Component health checks + macOS notifications
 │   └── dashboard/
-│       └── app.py                # FastAPI web dashboard (single-file, embedded UI)
+│       └── app.py                # FastAPI web dashboard + Setup Wizard
 ├── scripts/
-│   ├── setup.sh                  # First-time setup
-│   ├── install_launchd.sh        # Install all launchd agents from templates
-│   ├── uninstall_launchd.sh      # Remove agents
-│   ├── smoke_test.sh             # Test all extractors
-│   └── privacy_toggle.sh         # Toggle privacy mode
+│   ├── memoryos                  # CLI: start, stop, status, doctor, update
+│   ├── setup.sh                  # Developer setup (lightweight, no system deps)
+│   ├── install_launchd.sh        # Install launchd agents from templates
+│   ├── grant_permissions.sh      # macOS permissions helper
+│   └── smoke_test.sh             # Test all extractors
 ├── launchd/                      # Agent templates (.plist.template)
-├── ARCHITECTURE.md               # System design & roadmap
-└── requirements.txt              # Python dependencies
+└── ARCHITECTURE.md               # System design & roadmap
 ```
 
 ## Architecture

@@ -1,10 +1,14 @@
 # MemoryOS
 
-A local-first memory pipeline for macOS that captures everything you do, see, hear, and read -- and writes it as structured Markdown into an Obsidian vault. Then indexes it all for instant search and AI-powered querying from Cursor, ChatGPT, or any tool that can read files.
+A local-first memory pipeline for macOS that captures everything you do, see, hear, and read -- structures it as searchable Markdown -- and makes it instantly available to any AI tool. 100% local. No data leaves your machine.
 
-**This is the data collection and memory layer.** It gives you (and your AI tools) full context about your meetings, emails, screen activity, documents, and conversations -- all searchable, all local, all yours.
+![MemoryOS Architecture](assets/readme/architecture_overview.png)
 
-## What Gets Captured
+## How It Works
+
+MemoryOS continuously indexes your work context -- emails, meetings, screen activity, documents, and conversations -- into a structured Obsidian vault. A SQLite FTS5 index provides sub-millisecond search across everything. Context files are regenerated every 5 minutes so your AI tools always have fresh, complete situational awareness.
+
+![Data Pipeline](assets/readme/data_pipeline_flow.png)
 
 | Source | How | Output |
 |--------|-----|--------|
@@ -16,28 +20,55 @@ A local-first memory pipeline for macOS that captures everything you do, see, he
 | Teams chat | Screen OCR when Teams is active | `20_teams-chat/YYYY/MM/DD/teams.md` |
 | Documents | OneDrive files (docx, pptx, pdf, xlsx) | `40_slides/` and `50_knowledge/` |
 
-## System Monitoring
+## Skills & Capabilities
 
-MemoryOS includes a built-in **watchdog** that monitors every component and sends macOS notifications when something breaks or recovers.
+MemoryOS is the data layer. On top of it, modular AI skills turn context into action. Any AI tool -- Cursor, ChatGPT, custom GPTs -- can invoke these skills against your full work history.
 
-| Check | What it monitors | Alert threshold |
-|-------|-----------------|----------------|
-| Screen Recording | Screenpipe vision pipeline health and frame rate | Stale >30 min or >95% drop rate |
-| Audio Transcription | Screenpipe audio pipeline health | Stale >30 min |
-| Email Pipeline | Freshness of newest file in `00_inbox/` | No new files in >4 hours |
-| Meeting Transcripts | Freshness of newest file in `10_meetings/` | No new files in >8 hours |
-| Activity Tracking | Freshness of newest file in `85_activity/` | No new files in >2 hours |
-| Teams Chat | Freshness of newest file in `20_teams-chat/` | No new files in >24 hours |
-| Dashboard | HTTP health check on port 8765 | Unreachable |
-| Background Agents | All expected launchd agents loaded | Any agent missing |
+![Skills & Capabilities](assets/readme/skills_capabilities.png)
 
-Notifications fire only on **state transitions** (healthy to degraded, or recovered), not repeatedly. Check status anytime:
+## Using the System
+
+Once running, MemoryOS generates two things: raw Markdown files (detailed, per-item) and context files (summaries optimized for AI consumption). Here's how to use them with different tools.
+
+### With Cursor (Primary IDE)
+
+**Add your vault to the workspace.** Open Cursor, add your Obsidian vault folder (or at minimum, the `_context/` subfolder) to your workspace.
+
+**Reference context files with @:**
+
+- `@_context/today.md` -- "What meetings do I have today? What emails came in?"
+- `@_context/this_week.md` -- "Summarize what I worked on this week"
+- `@_context/recent_emails.md` -- "Any emails about the budget proposal?"
+- `@_context/upcoming.md` -- "What's on my calendar next week?"
+
+**Use the CLI in Cursor's terminal for deeper searches:**
 
 ```bash
-python3 src/monitor/watchdog.py --status
+python3 -m src.memory.cli search "quarterly review"
+python3 -m src.memory.cli recent --hours 48 --type email
+python3 -m src.memory.cli meetings
+python3 -m src.memory.cli stats
 ```
 
-The dashboard also exposes watchdog status at `GET /api/watchdog`.
+### With ChatGPT Enterprise
+
+- Upload `_context/today.md` or `_context/this_week.md` as attachments for situational context
+- Use the CLI to generate targeted context, then copy/paste:
+  ```bash
+  python3 -m src.memory.cli search "project alpha" 
+  ```
+- For recurring workflows, create a custom GPT with instructions about your data format
+
+### With AI Agents
+
+MemoryOS is designed as the **data layer** for AI agents:
+
+- **Read**: Agents read `_context/` files for situational awareness, or import `src.memory.index.MemoryIndex` directly for programmatic queries
+- **Query**: Agents call the CLI or use the Python API for search
+- **Act**: Agents propose actions (draft replies, schedule items) via the dashboard API
+- **Approve**: Human-in-the-loop review through the dashboard at `http://localhost:8765`
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full agent integration pattern.
 
 ## Quick Start
 
@@ -70,8 +101,6 @@ After setup, grant Full Disk Access to Python so email and calendar extraction r
 ./scripts/grant_permissions.sh
 ```
 
-This opens the correct System Settings pane and tells you exactly what to click.
-
 ### Managing MemoryOS
 
 ```bash
@@ -95,7 +124,49 @@ Both write structured Markdown into your Obsidian vault. MemoryOS picks up whate
 
 The Setup Wizard checks for Screenpipe automatically and shows its status.
 
-## Prerequisites (Detail)
+## Privacy
+
+MemoryOS runs **entirely locally**. No data leaves your machine unless you explicitly upload it.
+
+- **Privacy mode**: Create `config/.privacy_mode` to instantly disable all audio capture
+- **WiFi-based auto-privacy**: Automatically enables privacy mode on untrusted networks
+- **Work hours filter**: Only capture audio during configured hours
+- **Work app correlation**: Only keep audio when work apps are active on screen
+- **Minimum word filter**: Discard tiny audio fragments (noise)
+
+Toggle privacy from the dashboard, CLI, or:
+
+```bash
+./scripts/privacy_toggle.sh
+```
+
+## Dashboard
+
+The web dashboard provides monitoring and control at `http://localhost:8765`:
+
+- **Overview**: extractor status, launchd agent health, privacy controls
+- **Pipeline**: folder health, activity timeline, watchdog status
+- **File Browser**: browse and preview vault Markdown files
+- **Logs**: live extractor log viewer
+- **Settings**: trusted networks, work apps, audio filters
+- **Skills**: installed Cursor agent skills
+
+The dashboard runs automatically via launchd. To start manually: `python3 src/dashboard/app.py`
+
+## System Monitoring
+
+MemoryOS includes a built-in **watchdog** that monitors every component and sends macOS notifications when something breaks or recovers. Notifications fire only on **state transitions** (healthy to degraded, or recovered), not repeatedly.
+
+```bash
+python3 src/monitor/watchdog.py --status
+```
+
+The dashboard also exposes watchdog status at `GET /api/watchdog`.
+
+---
+
+<details>
+<summary><strong>Prerequisites</strong></summary>
 
 The installer handles all of these, but for reference:
 
@@ -120,7 +191,10 @@ If you use Microsoft 365 and want richer email/calendar data (full HTML bodies, 
 
 If you don't need Graph API, skip this entirely. Mail.app and Calendar.app work out of the box.
 
-## Configuration
+</details>
+
+<details>
+<summary><strong>Configuration</strong></summary>
 
 The Setup Wizard creates `config/config.yaml` and `.env.local` for you. To edit them manually:
 
@@ -143,8 +217,6 @@ Set your OneDrive sync folder in the Setup Wizard to automatically convert docum
 
 ### Environment Variable Overrides
 
-Any config path can be overridden via environment variables:
-
 | Variable | Config key |
 |----------|-----------|
 | `MEMORYOS_OBSIDIAN_VAULT` | `obsidian_vault` |
@@ -154,7 +226,10 @@ Any config path can be overridden via environment variables:
 | `MEMORYOS_STATE_FILE` | `state_file` |
 | `MEMORYOS_LOG_DIR` | `log_dir` |
 
-## Background Agents
+</details>
+
+<details>
+<summary><strong>Background Agents</strong></summary>
 
 After activation, these launchd agents run automatically:
 
@@ -177,17 +252,10 @@ After activation, these launchd agents run automatically:
 ### Running Extractors Manually
 
 ```bash
-# Screen activity + audio transcription
 python3 src/extractors/screenpipe_extractor.py
-
-# Email (pick one based on your setup)
 python3 src/extractors/mail_app_extractor.py
 python3 src/extractors/outlook_extractor.py
-
-# Calendar
 python3 src/extractors/calendar_app_extractor.py
-
-# OneDrive documents
 python3 src/extractors/onedrive_extractor.py
 ```
 
@@ -195,98 +263,39 @@ All extractors support `--dry-run` to preview output without writing files.
 
 ### Initial Backfill (Optional)
 
-Import existing email history:
-
 ```bash
-# Outlook Classic: import all emails (may take several minutes)
 python3 src/extractors/outlook_extractor.py --backfill
-
-# Mail.app: import last year
 python3 src/extractors/mail_app_extractor.py --days-back 365
-
-# Rebuild the index after backfill
 python3 -m src.memory.cli reindex --full
 ```
 
-## Using the System
+</details>
 
-Once running, MemoryOS generates two things: raw Markdown files (detailed, per-item) and context files (summaries optimized for AI consumption). Here's how to use them with different tools.
+<details>
+<summary><strong>Audio Capture Setup</strong></summary>
 
-### With Cursor (Primary IDE)
+For useful meeting transcripts, Screenpipe needs to hear **both** sides of a call -- your microphone and the system audio from other participants.
 
-**Add your vault to the workspace.** Open Cursor, add your Obsidian vault folder (or at minimum, the `_context/` subfolder) to your workspace.
+1. **Install BlackHole**: `brew install blackhole-2ch`
+2. **Create Multi-Output Device**: Open Audio MIDI Setup > **+** > Create Multi-Output Device. Check your speakers **and** BlackHole 2ch.
+3. **Route system audio**: System Settings > Sound > Output > select the Multi-Output Device.
+4. **Configure Screenpipe**: Add BlackHole 2ch as an audio **input** device in Screenpipe settings.
+5. **Verify**: Join a test call and confirm both sides are captured.
 
-**Reference context files with @:**
+### Audio filtering
 
-- `@_context/today.md` -- "What meetings do I have today? What emails came in?"
-- `@_context/this_week.md` -- "Summarize what I worked on this week"
-- `@_context/recent_emails.md` -- "Any emails about the budget proposal?"
-- `@_context/upcoming.md` -- "What's on my calendar next week?"
+Audio noise is controlled in `config/config.yaml` under `privacy`:
 
-**Use the CLI in Cursor's terminal for deeper searches:**
+- **work_apps**: Audio is only kept when one of these apps was on-screen within 2 minutes.
+- **work_hours_only**: When `true`, audio outside configured hours is filtered.
+- **min_words**: Fragments shorter than this word count are filtered.
 
-```bash
-# Search across everything
-python3 -m src.memory.cli search "quarterly review"
+Filtered audio is never deleted -- it goes into a collapsible `<details>` section at the bottom of each audio note.
 
-# Recent emails only
-python3 -m src.memory.cli recent --hours 48 --type email
+</details>
 
-# Today's meetings
-python3 -m src.memory.cli meetings
-
-# Index stats
-python3 -m src.memory.cli stats
-```
-
-**Tip:** Create a `.cursorrules` file in your project that tells the AI about your memory system:
-
-```
-I have a personal memory system in my Obsidian vault. Context files in _context/ are auto-updated every 5 minutes with my meetings, emails, activity, and upcoming events. Reference @_context/today.md for today's context. For deeper searches, use the CLI: python3 -m src.memory.cli search "query"
-```
-
-### With ChatGPT Enterprise
-
-- Upload `_context/today.md` or `_context/this_week.md` as attachments for situational context
-- Use the CLI to generate targeted context, then copy/paste:
-  ```bash
-  python3 -m src.memory.cli search "project alpha" 
-  ```
-- For recurring workflows, create a custom GPT with instructions about your data format
-
-### With AI Agents
-
-MemoryOS is designed as the **data layer** for AI agents:
-
-- **Read**: Agents read `_context/` files for situational awareness, or import `src.memory.index.MemoryIndex` directly for programmatic queries
-- **Query**: Agents call the CLI or use the Python API for search
-- **Act**: Agents propose actions (draft replies, schedule items) via the dashboard API
-- **Approve**: Human-in-the-loop review through the dashboard at `http://localhost:8765`
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full agent integration pattern.
-
-## Dashboard
-
-The web dashboard provides monitoring and control:
-
-```
-http://localhost:8765
-```
-
-- **Overview**: extractor status, launchd agent health, privacy controls
-- **Pipeline**: folder health, activity timeline, watchdog status
-- **File Browser**: browse and preview vault Markdown files
-- **Logs**: live extractor log viewer
-- **Settings**: trusted networks, work apps, audio filters
-- **Skills**: installed Cursor agent skills
-
-The dashboard runs automatically via launchd. It auto-recovers from port conflicts by killing stale processes on startup. To start manually:
-
-```bash
-python3 src/dashboard/app.py
-```
-
-### Dashboard API
+<details>
+<summary><strong>Dashboard API</strong></summary>
 
 | Endpoint | Description |
 |----------|-------------|
@@ -299,68 +308,10 @@ python3 src/dashboard/app.py
 | `POST /api/run/{extractor}` | Manually trigger an extractor run |
 | `POST /api/agent/{name}/{action}` | Control launchd agents (start/stop/restart) |
 
-## Audio Capture Setup
+</details>
 
-For useful meeting transcripts, Screenpipe needs to hear **both** sides of a call -- your microphone and the system audio from other participants. By default, Screenpipe only captures your mic input, which means you get your own voice plus ambient noise but very little of what others say.
-
-### 1. Install BlackHole (virtual audio loopback)
-
-```bash
-brew install blackhole-2ch
-```
-
-### 2. Create a Multi-Output Device
-
-1. Open **Audio MIDI Setup** (Spotlight search)
-2. Click **+** at bottom left > **Create Multi-Output Device**
-3. Check both your real speakers (e.g. "MacBook Pro Speakers" or your headphones) **and** "BlackHole 2ch"
-4. Optionally rename it to "Meeting Audio"
-
-### 3. Route system audio through it
-
-Go to **System Settings > Sound > Output** and select the Multi-Output Device you just created. Teams/Zoom/Meet audio now flows through BlackHole.
-
-### 4. Tell Screenpipe to capture BlackHole
-
-In Screenpipe's settings, add **BlackHole 2ch** as an audio **input** device. Screenpipe will now transcribe the system audio stream -- i.e., what other meeting participants are saying.
-
-### 5. Verify
-
-Join a test call and confirm Screenpipe captures both your voice (from the mic) and the other party's voice (from BlackHole). Check `~/.screenpipe/db.sqlite` with:
-
-```bash
-sqlite3 ~/.screenpipe/db.sqlite "SELECT id, timestamp, substr(transcription, 1, 80) FROM audio_transcriptions ORDER BY id DESC LIMIT 10;"
-```
-
-### Audio filtering
-
-Audio noise is controlled in `config/config.yaml` under `privacy`:
-
-- **work_apps**: Audio is only kept when one of these apps was on-screen within 2 minutes. Set to your work apps (Teams, Chrome, Cursor, etc.).
-- **work_hours_only**: When `true`, audio outside the configured hours is filtered to the collapsible section.
-- **min_words**: Fragments shorter than this word count are filtered.
-
-Filtered audio is never deleted -- it goes into a collapsible `<details>` section at the bottom of each audio note.
-
-## Privacy
-
-MemoryOS runs **entirely locally**. No data leaves your machine unless you explicitly upload it.
-
-### Privacy Controls
-
-- **Privacy mode**: Create `config/.privacy_mode` to instantly disable all audio capture
-- **WiFi-based auto-privacy**: Automatically enables privacy mode on untrusted networks
-- **Work hours filter**: Only capture audio during configured hours
-- **Work app correlation**: Only keep audio when work apps are active on screen
-- **Minimum word filter**: Discard tiny audio fragments (noise)
-
-Toggle privacy from the dashboard, CLI, or:
-
-```bash
-./scripts/privacy_toggle.sh
-```
-
-## CLI Reference
+<details>
+<summary><strong>CLI Reference</strong></summary>
 
 ```bash
 python3 -m src.memory.cli search "query"              # Full-text search
@@ -383,7 +334,10 @@ python3 src/monitor/watchdog.py --quiet     # Check health without notifications
 python3 src/monitor/watchdog.py             # Check health and notify on changes
 ```
 
-## Logs
+</details>
+
+<details>
+<summary><strong>Logs</strong></summary>
 
 - Application: `logs/memoryos.log` (rotating, 5 MB, 3 backups)
 - Per-extractor: `logs/*_launchd.log` and `logs/*_launchd.err`
@@ -391,7 +345,10 @@ python3 src/monitor/watchdog.py             # Check health and notify on changes
 - Indexer: `logs/indexer.err`
 - Watchdog: `logs/watchdog.err`
 
-## Troubleshooting
+</details>
+
+<details>
+<summary><strong>Troubleshooting</strong></summary>
 
 **Extractors not running?**
 1. Check launchd status: `launchctl list | grep memoryos`
@@ -433,7 +390,10 @@ python3 src/monitor/watchdog.py             # Check health and notify on changes
 1. Run `python3 -m src.memory.cli reindex --full`
 2. Check vault path in config: `grep obsidian_vault config/config.yaml`
 
-## Project Structure
+</details>
+
+<details>
+<summary><strong>Project Structure</strong></summary>
 
 ```
 MemoryOS/
@@ -482,6 +442,8 @@ MemoryOS/
 ├── launchd/                      # Agent templates (.plist.template)
 └── ARCHITECTURE.md               # System design & roadmap
 ```
+
+</details>
 
 ## Architecture
 

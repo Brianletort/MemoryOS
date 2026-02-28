@@ -36,7 +36,7 @@ CONFIG_PATH = REPO_DIR / "config" / "config.yaml"
 MAX_TOOL_ITERATIONS = 5
 MAX_HISTORY_MESSAGES = 40
 
-TOOL_MODEL = "gpt-4o-mini"
+TOOL_MODEL = "gpt-5-mini"
 SYNTHESIS_MODEL = "gpt-5.2"
 
 TOOL_CONTEXT_FILES = (
@@ -64,8 +64,10 @@ Today is {date}. Current time: {time}.
 
 ## Your capabilities
 - Search and read the memory vault (emails, meetings, transcripts, activity, documents)
+- Search the web using Brave Search for current news, company info, people, technology, or any external topic
+- Build PowerPoint presentations using the build_slides tool
+- Analyze uploaded files (PDF, DOCX, PPTX, Excel, CSV, code, images) -- file content is injected into context
 - Run skills (morning-brief, meeting-prep, weekly-status, news-pulse, plan-my-week, etc.)
-- Search the web for current information
 - Send emails via Mail.app or SMTP
 - Write notes, action items, and documents to the vault
 - Execute shell commands (read-only, scoped)
@@ -88,6 +90,13 @@ Today is {date}. Current time: {time}.
 - For questions about people, check emails, meetings, AND Teams -- don't stop at one source.
 - If a search returns no results or an error, move on. Don't retry with similar terms.
 - NEVER call context_summary as a tool -- the pre-loaded context already contains all context files.
+
+## When to use specific tools
+- **External topics** (companies, people, news, technology, competitors): use web_search. Don't guess -- search.
+- **"Tell me about [company/person/topic]"**: use web_search with search_type "web" or "ai" for a grounded summary.
+- **Creating slides/deck/presentation**: use build_slides with a structured spec. Include a title slide, content slides with bullets, metrics if available, and a summary/takeaways slide.
+- **Uploaded files**: the file content is already injected into context below. Reference it directly -- no need to call analyze_file unless you need to re-read a previously uploaded file.
+- **"Tell me about my day"**: use context_summary and meeting_overview to gather calendar, emails, and activity data.
 
 ## Pre-loaded context
 The following context was gathered automatically before you received this message.
@@ -193,8 +202,27 @@ def _extract_keywords(text: str) -> list[str]:
     return keywords[:8]
 
 
+_DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    "email": ["email", "mail", "sent", "received", "inbox", "from", "reply", "forward", "subject"],
+    "meeting": ["meeting", "call", "standup", "sync", "transcript", "attendee", "agenda", "discussed"],
+    "activity": ["screen", "activity", "app", "worked", "focus", "switched", "browsed"],
+    "teams": ["teams", "chat", "message", "channel", "slack", "thread"],
+    "knowledge": ["document", "wiki", "policy", "procedure", "guide", "handbook"],
+}
+
+
+def _detect_domains(query: str) -> list[str]:
+    """Detect which source domains a query is likely about."""
+    query_lower = query.lower()
+    matched: list[str] = []
+    for domain, keywords in _DOMAIN_KEYWORDS.items():
+        if any(kw in query_lower for kw in keywords):
+            matched.append(domain)
+    return matched
+
+
 def _auto_rag(query: str, config: dict[str, Any]) -> str:
-    """Run automatic memory search on query keywords before LLM sees the message."""
+    """Multi-domain auto-RAG: detect intent and search relevant source types."""
     keywords = _extract_keywords(query)
     if not keywords:
         return ""
@@ -208,18 +236,32 @@ def _auto_rag(query: str, config: dict[str, Any]) -> str:
         db_path = config.get("memory", {}).get("index_db", "config/memory.db")
         idx = MemoryIndex(REPO_DIR / db_path)
         try:
-            results = idx.search(search_query, limit=15)
+            domains = _detect_domains(query)
+            all_results: list[dict[str, Any]] = []
+
+            if domains:
+                for domain in domains:
+                    results = idx.search(search_query, source_type=domain, limit=10)
+                    all_results.extend(results)
+                general = idx.search(search_query, limit=5)
+                seen_paths = {r.get("path") for r in all_results}
+                all_results.extend(r for r in general if r.get("path") not in seen_paths)
+            else:
+                all_results = idx.search(search_query, limit=15)
         finally:
             idx.close()
     except Exception as exc:
         logger.warning("Auto-RAG search failed: %s", exc)
         return ""
 
-    if not results:
+    if not all_results:
         return ""
 
+    all_results.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    all_results = all_results[:20]
+
     lines = [f"### Auto-retrieved vault results for: {search_query}\n"]
-    for r in results:
+    for r in all_results:
         title = r.get("title", "Untitled")
         path = r.get("path", "")
         snippet = (r.get("content", ""))[:1500]
@@ -235,41 +277,92 @@ class AgentSession:
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config or load_config(CONFIG_PATH)
         self.history: list[dict[str, Any]] = []
+        self._attachment_context: str = ""
+
+    def restore_history(self, messages: list[dict[str, Any]]) -> None:
+        """Restore conversation history from persisted session messages."""
+        self.history = []
+        for m in messages:
+            entry: dict[str, Any] = {"role": m["role"], "content": m["content"]}
+            if m.get("tool_calls"):
+                entry["tool_calls"] = m["tool_calls"]
+            self.history.append(entry)
+        self._trim_history()
+
+    def set_attachment_context(self, text: str) -> None:
+        """Inject file attachment text into the next turn's context."""
+        self._attachment_context = text
 
     def _trim_history(self) -> None:
         while len(self.history) > MAX_HISTORY_MESSAGES:
             self.history.pop(0)
 
-    async def run_turn(self, user_message: str) -> AsyncGenerator[dict[str, Any], None]:
+    async def run_turn(
+        self,
+        user_message: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        web_enabled: bool = True,
+        modes: list[str] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """Run one user turn through the three-phase loop.
 
         Phase 1: Auto-RAG pre-load (no LLM)
         Phase 2: Tool loop with gpt-5-mini
-        Phase 3: Synthesis with gpt-5.2
+        Phase 3: Synthesis with streaming via selected model
         """
         self.history.append({"role": "user", "content": user_message})
         self._trim_history()
 
+        synthesis_model = model or SYNTHESIS_MODEL
+        modes = modes or []
+
         # ── Phase 1: Auto-RAG pre-load ──
+        yield {"type": "status", "text": "Loading context..."}
         now = datetime.now()
         tool_context = await asyncio.to_thread(
             _load_context_files, self.config, TOOL_CONTEXT_FILES,
         )
+
+        yield {"type": "status", "text": "Searching memory vault..."}
         rag_results = await asyncio.to_thread(_auto_rag, user_message, self.config)
 
         tool_prompt_context = tool_context
         if rag_results:
             tool_prompt_context += "\n\n---\n\n" + rag_results
+        if self._attachment_context:
+            tool_prompt_context += "\n\n---\n\n### Attached file content\n\n" + self._attachment_context
+            self._attachment_context = ""
+
+        mode_instructions = ""
+        if "image" in modes:
+            mode_instructions += (
+                "\n\n## Image Generation Mode\n"
+                "The user has requested image generation. Use the generate_image tool "
+                "to create the image they describe.\n"
+            )
+        if "pptx" in modes:
+            mode_instructions += (
+                "\n\n## PowerPoint Mode\n"
+                "The user has requested a PowerPoint presentation. Use the build_slides "
+                "tool to create the deck they describe.\n"
+            )
 
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             date=now.strftime("%A, %B %d, %Y"),
             time=now.strftime("%I:%M %p"),
             context=tool_prompt_context,
-        )
+        ) + mode_instructions
 
         messages = [{"role": "system", "content": system_prompt}] + self.history
 
         # ── Phase 2: Tool loop (gpt-5-mini) ──
+        yield {"type": "status", "text": "Analyzing query..."}
+        tool_schemas = list(TOOL_SCHEMAS)
+        if not web_enabled:
+            tool_schemas = [t for t in tool_schemas if t["function"]["name"] != "web_search"]
+
         gathered_data: list[str] = []
         tool_call_count = 0
 
@@ -277,8 +370,9 @@ class AgentSession:
             try:
                 response = llm_provider.complete_with_tools(
                     messages=messages,
-                    tools=TOOL_SCHEMAS,
+                    tools=tool_schemas,
                     model_override=TOOL_MODEL,
+                    reasoning_effort_override="none",
                 )
             except Exception as exc:
                 logger.exception("Tool-loop LLM call failed")
@@ -302,6 +396,21 @@ class AgentSession:
                 except json.JSONDecodeError:
                     fn_args = {}
 
+                _TOOL_STATUS = {
+                    "memory_search": "Searching vault...",
+                    "vault_read": "Reading file...",
+                    "vault_browse": "Browsing vault...",
+                    "vault_recent": "Finding recent docs...",
+                    "context_summary": "Loading context...",
+                    "run_skill": "Running skill...",
+                    "web_search": "Searching the web...",
+                    "send_email": "Sending email...",
+                    "vault_write": "Writing to vault...",
+                    "meeting_overview": "Loading meetings...",
+                    "build_slides": "Building presentation...",
+                    "analyze_file": "Analyzing file...",
+                }
+                yield {"type": "status", "text": _TOOL_STATUS.get(fn_name, f"Running {fn_name}...")}
                 yield {"type": "tool_call", "name": fn_name, "args": fn_args}
                 tool_call_count += 1
 
@@ -323,7 +432,8 @@ class AgentSession:
                 self.history.append(tool_msg)
                 messages.append(tool_msg)
 
-        # ── Phase 3: Synthesis (gpt-5.2) ──
+        # ── Phase 3: Synthesis (streaming) ──
+        yield {"type": "status", "text": "Generating response..."}
         synthesis_system = SYNTHESIS_PROMPT.format(
             date=now.strftime("%A, %B %d, %Y"),
             time=now.strftime("%I:%M %p"),
@@ -352,12 +462,32 @@ class AgentSession:
         ]
 
         try:
-            synth_response = llm_provider.complete_with_tools(
-                messages=synthesis_messages,
-                tools=[],
-                model_override=SYNTHESIS_MODEL,
-            )
-            text = synth_response.choices[0].message.content or ""
+            accumulated: list[str] = []
+            queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+            def _stream_worker() -> None:
+                try:
+                    for chunk in llm_provider.complete_streaming(
+                        messages=synthesis_messages,
+                        model_override=synthesis_model,
+                        reasoning_effort_override=reasoning_effort,
+                    ):
+                        queue.put_nowait(chunk)
+                finally:
+                    queue.put_nowait(None)
+
+            loop = asyncio.get_event_loop()
+            fut = loop.run_in_executor(None, _stream_worker)
+
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield {"type": "content", "text": chunk}
+                accumulated.append(chunk)
+
+            await fut
+            text = "".join(accumulated)
         except Exception as exc:
             logger.exception("Synthesis LLM call failed")
             yield {"type": "error", "content": f"Synthesis error: {exc}"}

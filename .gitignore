@@ -6,6 +6,7 @@ config/state.json
 config/memory.db
 config/memory.db-journal
 config/watchdog_state.json
+config/approvals_state.json
 config/.graph_token_cache.bin
 config/.privacy_mode
 logs/
@@ -38,3 +39,38 @@ venv/
 
 # Watchdog runtime state
 config/watchdog_state.json
+
+# Chat database
+config/chat.db
+config/chat.db-journal
+config/chat.db-wal
+
+# File uploads and generated files
+data/uploads/
+data/generated/
+
+# Runtime heal / monitor state
+config/heal_*.json
+config/resource_monitor_state.json
+
+# Personal data / screenshots
+data.txt
+myday-*.png
+
+# Personal build scripts (contain hardcoded local paths)
+scripts/build_ai_deployment_v*.py
+scripts/build_ai_tools_deck.py
+
+# Personal / company-specific docs
+docs/
+
+# Company presentation assets
+assets/v43/
+assets/v44/
+assets/v45/
+assets/slide*.png
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/

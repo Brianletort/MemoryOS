@@ -12,6 +12,7 @@ import glob as globmod
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 # Allow running from repo root
@@ -30,10 +32,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.common.config import load_config
 from src.common.state import load_state
+from src.dashboard.report_fallback import extract_embedded_json, normalize_report, parse_project_brief_markdown
 
 logger = logging.getLogger("memoryos.dashboard")
 
 app = FastAPI(title="MemoryOS Control Panel", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+from src.chat.routes import router as chat_router, prune_idle_sessions as _prune_chat_sessions
+app.include_router(chat_router)
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -67,20 +81,46 @@ def _load_env_local() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TTL cache for expensive operations
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ttl_cache: dict[str, tuple[float, Any]] = {}
+
+
+def _cached(key: str, ttl: float, fn: Any, *args: Any) -> Any:
+    """Return cached result if within TTL, otherwise call fn and cache."""
+    now = time.time()
+    entry = _ttl_cache.get(key)
+    if entry and (now - entry[0]) < ttl:
+        return entry[1]
+    result = fn(*args)
+    _ttl_cache[key] = (now, result)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Helper functions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _count_files(directory: Path, pattern: str = "*.md") -> int:
+def _count_files_uncached(directory: Path, pattern: str = "*.md") -> int:
     if not directory.exists():
         return 0
     return sum(1 for _ in directory.rglob(pattern))
 
 
-def _dir_size_mb(directory: Path) -> float:
+def _count_files(directory: Path, pattern: str = "*.md") -> int:
+    return _cached(f"count:{directory}:{pattern}", 30.0, _count_files_uncached, directory, pattern)
+
+
+def _dir_size_mb_uncached(directory: Path) -> float:
     if not directory.exists():
         return 0.0
     total = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
     return round(total / (1024 * 1024), 1)
+
+
+def _dir_size_mb(directory: Path) -> float:
+    return _cached(f"size:{directory}", 30.0, _dir_size_mb_uncached, directory)
 
 
 def _tail_log(log_path: Path, lines: int = 50) -> str:
@@ -260,6 +300,105 @@ def _screenpipe_audio_api(*, start: bool) -> None:
     threading.Thread(target=_call, daemon=True).start()
 
 
+def _screenpipe_device_api(path: str, body: dict[str, Any] | None = None) -> Any:
+    """Call a Screenpipe device API endpoint synchronously."""
+    import urllib.request
+    import urllib.error
+    url = f"http://localhost:3030{path}"
+    if body is not None:
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+    else:
+        req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read())
+
+
+@app.get("/api/audio/devices")
+async def api_audio_devices() -> JSONResponse:
+    """List available audio input devices from Screenpipe."""
+    cfg = _cfg()
+    preferred = cfg.get("screenpipe", {}).get("preferred_input_device")
+    try:
+        devices = _screenpipe_device_api("/audio/list")
+    except Exception:
+        return JSONResponse({
+            "devices": [],
+            "preferred": preferred,
+            "error": "Screenpipe API unreachable",
+        })
+    input_devices = [
+        {"name": d.get("name", ""), "is_input": d.get("is_input", True)}
+        for d in devices
+        if d.get("name")
+    ]
+    return JSONResponse({
+        "devices": input_devices,
+        "preferred": preferred,
+    })
+
+
+@app.post("/api/audio/device")
+async def api_audio_device_switch(request: Request) -> JSONResponse:
+    """Switch the active audio input device in Screenpipe and persist preference."""
+    body = await request.json()
+    device_name = body.get("device_name", "").strip()
+    if not device_name:
+        return JSONResponse({"error": "device_name is required"}, status_code=400)
+
+    errors: list[str] = []
+
+    try:
+        devices = _screenpipe_device_api("/audio/list")
+    except Exception:
+        return JSONResponse(
+            {"error": "Screenpipe API unreachable"}, status_code=502,
+        )
+
+    known_names = {d.get("name", "") for d in devices if d.get("name")}
+    if device_name not in known_names:
+        return JSONResponse(
+            {"error": f"Unknown device: {device_name}", "available": sorted(known_names)},
+            status_code=404,
+        )
+
+    for d in devices:
+        name = d.get("name", "")
+        if not name or name == device_name:
+            continue
+        try:
+            _screenpipe_device_api("/audio/device/stop", {"device_name": name})
+        except Exception:
+            errors.append(f"Failed to stop {name}")
+
+    try:
+        _screenpipe_device_api("/audio/device/start", {"device_name": device_name})
+    except Exception:
+        errors.append(f"Failed to start {device_name}")
+
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        raw.setdefault("screenpipe", {})["preferred_input_device"] = device_name
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            yaml.dump(
+                raw, f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+                width=200,
+            )
+    except Exception as exc:
+        errors.append(f"Config save failed: {exc}")
+
+    return JSONResponse({
+        "status": "ok" if not errors else "partial",
+        "active_device": device_name,
+        "errors": errors,
+    })
+
+
 def _files_created_today(directory: Path) -> int:
     if not directory.exists():
         return 0
@@ -385,6 +524,105 @@ async def api_watchdog() -> JSONResponse:
         return JSONResponse(data)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+_gpu_name_cache: str | None = None
+
+
+def _get_gpu_name() -> str:
+    """Cache GPU name from system_profiler (expensive call, run once)."""
+    global _gpu_name_cache
+    if _gpu_name_cache is not None:
+        return _gpu_name_cache
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        gpus = json.loads(r.stdout).get("SPDisplaysDataType", [])
+        _gpu_name_cache = gpus[0].get("sppci_model", "Unknown") if gpus else "N/A"
+    except Exception:
+        _gpu_name_cache = "N/A"
+    return _gpu_name_cache
+
+
+@app.get("/api/system-health")
+async def api_system_health() -> JSONResponse:
+    """Return resource monitor state enriched with live psutil metrics."""
+    import psutil as _ps
+
+    state_file = REPO_DIR / "config" / "resource_monitor_state.json"
+    data: dict[str, Any] = {}
+    if state_file.is_file():
+        try:
+            data = json.loads(state_file.read_text())
+        except Exception:
+            pass
+
+    try:
+        data["cpu_per_core"] = _ps.cpu_percent(interval=0.1, percpu=True)
+        data["cpu_count"] = _ps.cpu_count(logical=True)
+        freq = _ps.cpu_freq()
+        data["cpu_freq_ghz"] = round(freq.current, 1) if freq else None
+
+        data["load_avg"] = [round(x, 2) for x in _ps.getloadavg()]
+        data["uptime_hours"] = round((time.time() - _ps.boot_time()) / 3600, 1)
+
+        net = _ps.net_io_counters()
+        data["net_io"] = {
+            "sent_mb": round(net.bytes_sent / (1024 * 1024), 1),
+            "recv_mb": round(net.bytes_recv / (1024 * 1024), 1),
+        }
+
+        bat = _ps.sensors_battery()
+        if bat:
+            data["battery"] = {"percent": bat.percent, "plugged": bat.power_plugged}
+        else:
+            data["battery"] = None
+
+        data["gpu_name"] = _get_gpu_name()
+
+        procs: list[dict[str, Any]] = []
+        for p in _ps.process_iter(["pid", "name", "memory_info", "cpu_percent"]):
+            try:
+                pi = p.info
+                rss = pi["memory_info"].rss / (1024 * 1024) if pi["memory_info"] else 0
+                if rss > 50:
+                    procs.append({
+                        "pid": pi["pid"],
+                        "name": (pi["name"] or "")[:40],
+                        "rss_mb": round(rss, 1),
+                        "cpu": pi["cpu_percent"] or 0,
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs.sort(key=lambda x: x["rss_mb"], reverse=True)
+        data["top_processes"] = procs[:12]
+
+        if "system" not in data:
+            vm = _ps.virtual_memory()
+            data["system"] = {
+                "ram_total_gb": round(vm.total / (1024**3), 1),
+                "ram_used_gb": round(vm.used / (1024**3), 1),
+                "ram_percent": vm.percent,
+                "cpu_percent": _ps.cpu_percent(),
+            }
+        if "disk" not in data:
+            du = _ps.disk_usage("/")
+            data["disk"] = {
+                "disk_total_gb": round(du.total / (1024**3), 1),
+                "disk_free_gb": round(du.free / (1024**3), 1),
+                "disk_percent": du.percent,
+            }
+
+    except Exception as exc:
+        logger.warning("Live psutil enrichment failed: %s", exc)
+
+    if not data:
+        return JSONResponse({"error": "No resource monitor data yet"}, status_code=404)
+
+    return JSONResponse(data)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -736,6 +974,288 @@ async def api_timeline(date: str) -> JSONResponse:
         "has_data": any(
             sum(v.values()) > 0 for v in hours.values()
         ),
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API: My Day
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CAL_EVENT_RE = re.compile(
+    r"^## (?:All Day:\s*(?P<allday>.+)|(?P<start>\d{2}:\d{2})\s*-\s*(?P<end>\d{2}:\d{2}):\s*(?P<title>.+))$"
+)
+_RECALL_BLOCK_RE = re.compile(
+    r"^## (?P<start>\d{2}:\d{2})\s*-\s*(?P<end>\d{2}:\d{2})\s*\|\s*(?P<title>.+)$"
+)
+_AUDIO_SPEAKER_RE = re.compile(r"^\*\*(?P<name>[^*]+)\s*\(")
+
+_MONTH_ABBR = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _parse_calendar_md(text: str) -> list[dict[str, Any]]:
+    """Parse calendar.md into a list of event dicts."""
+    events: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    for line in text.splitlines():
+        m = _CAL_EVENT_RE.match(line.strip())
+        if m:
+            if current:
+                events.append(current)
+            if m.group("allday"):
+                current = {
+                    "summary": m.group("allday").strip(),
+                    "start": None, "end": None,
+                    "is_all_day": True, "location": "",
+                    "attendees": [], "organizer": "",
+                }
+            else:
+                current = {
+                    "summary": (m.group("title") or "").strip(),
+                    "start": m.group("start"),
+                    "end": m.group("end"),
+                    "is_all_day": False, "location": "",
+                    "attendees": [], "organizer": "",
+                }
+            continue
+
+        if current and line.strip().startswith("- **"):
+            kv = line.strip()[4:]
+            if kv.startswith("Location:**"):
+                current["location"] = kv.split(":**", 1)[1].strip()
+            elif kv.startswith("Organizer:**"):
+                current["organizer"] = kv.split(":**", 1)[1].strip()
+            elif kv.startswith("Attendees:**"):
+                raw = kv.split(":**", 1)[1].strip()
+                current["attendees"] = [a.strip() for a in raw.split(",") if a.strip()]
+
+    if current:
+        events.append(current)
+    return events
+
+
+def _parse_recall_md(text: str) -> list[dict[str, Any]]:
+    """Parse recall.md into task-recall blocks."""
+    blocks: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    for line in text.splitlines():
+        m = _RECALL_BLOCK_RE.match(line.strip())
+        if m:
+            if current:
+                blocks.append(current)
+            current = {
+                "start": m.group("start"),
+                "end": m.group("end"),
+                "title": m.group("title").strip(),
+                "apps": [], "details": [], "artifacts": [],
+            }
+            continue
+
+        if current:
+            stripped = line.strip()
+            if stripped.startswith("**Apps:**"):
+                current["apps"] = [a.strip() for a in stripped[9:].split(",") if a.strip()]
+            elif stripped.startswith("**Tasks:**"):
+                pass
+            elif stripped.startswith("**Artifacts:**"):
+                pass
+            elif stripped.startswith("- ") and current:
+                item = stripped[2:].strip()
+                if current["artifacts"] is not None and any(
+                    kw in item.lower() for kw in ("http", "://", ".md", ".py", ".ts", "pid", "email")
+                ):
+                    current["artifacts"].append(item)
+                else:
+                    current["details"].append(item)
+
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+_SPEAKER_N_RE = re.compile(r"^Speaker\s+\d+$", re.IGNORECASE)
+
+
+def _extract_people(calendar_events: list[dict], audio_text: str) -> list[dict[str, Any]]:
+    """Aggregate people from calendar attendees and audio speakers.
+
+    Filters out anonymous 'Speaker N' placeholders from Screenpipe.
+    Uses calendar attendees as a proxy for meeting participants when
+    speaker diarization can't identify voices.
+    """
+    people: dict[str, dict[str, Any]] = {}
+
+    for ev in calendar_events:
+        if ev.get("is_all_day"):
+            continue
+        start_str = ev.get("start", "")
+        end_str = ev.get("end", "")
+        try:
+            s = datetime.strptime(start_str, "%H:%M")
+            e = datetime.strptime(end_str, "%H:%M")
+            dur = max((e - s).seconds / 60, 0)
+        except (ValueError, TypeError):
+            dur = 30
+
+        for name in ev.get("attendees", []):
+            name = name.strip()
+            if not name:
+                continue
+            if name not in people:
+                people[name] = {"name": name, "meetings": 0, "total_minutes": 0}
+            people[name]["meetings"] += 1
+            people[name]["total_minutes"] += dur
+
+        org = (ev.get("organizer") or "").strip()
+        if org and org not in people:
+            people[org] = {"name": org, "meetings": 0, "total_minutes": 0}
+        if org and org in people:
+            people[org]["meetings"] = max(people[org]["meetings"], 1)
+
+    for line in audio_text.splitlines():
+        m = _AUDIO_SPEAKER_RE.match(line.strip())
+        if m:
+            name = m.group("name").strip()
+            if name.lower() in ("you", "speaker", "unknown"):
+                continue
+            if _SPEAKER_N_RE.match(name):
+                continue
+            if name not in people:
+                people[name] = {"name": name, "meetings": 0, "total_minutes": 0}
+
+    return sorted(people.values(), key=lambda p: -p["total_minutes"])
+
+
+def _fuzzy_date_match(date_str: str, target: datetime) -> bool:
+    """Check if a human date string like 'Feb 25' matches a target date."""
+    if not date_str:
+        return False
+    date_str = date_str.strip().lower()
+    parts = date_str.replace(",", " ").split()
+    month = None
+    day = None
+    for p in parts:
+        if p in _MONTH_ABBR:
+            month = _MONTH_ABBR[p]
+        elif p.isdigit():
+            day = int(p)
+    if month and day:
+        return target.month == month and target.day == day
+    return False
+
+
+def _get_work_for_date(vault: Path, target: datetime) -> tuple[list[dict], list[dict]]:
+    """Return (completed, in_progress) tasks for a given date from tasks.md."""
+    tasks_path = vault / CONTEXT_DIR / "tasks.md"
+    if not tasks_path.is_file():
+        return [], []
+
+    content = tasks_path.read_text(encoding="utf-8", errors="replace")
+    parsed = _parse_tasks_md(content)
+
+    completed: list[dict[str, Any]] = []
+    in_progress: list[dict[str, Any]] = []
+
+    def _scan_tasks(tasks: list[dict], project_name: str) -> None:
+        for t in tasks:
+            if t["status"] == "complete" and _fuzzy_date_match(t.get("due", ""), target):
+                completed.append({
+                    "task": t["task"], "priority": t.get("priority", "P1"),
+                    "project": project_name,
+                })
+            elif t["status"] == "in_progress":
+                in_progress.append({
+                    "task": t["task"], "priority": t.get("priority", "P1"),
+                    "project": project_name, "notes": t.get("notes", ""),
+                })
+            for sub in t.get("subtasks", []):
+                if sub["status"] == "complete" and _fuzzy_date_match(sub.get("due", ""), target):
+                    completed.append({
+                        "task": sub["task"], "priority": sub.get("priority", "P1"),
+                        "project": project_name,
+                    })
+                elif sub["status"] == "in_progress":
+                    in_progress.append({
+                        "task": sub["task"], "priority": sub.get("priority", "P1"),
+                        "project": project_name, "notes": sub.get("notes", ""),
+                    })
+
+    for proj in parsed.get("projects", []):
+        _scan_tasks(proj.get("tasks", []), proj.get("name", ""))
+
+    return completed, in_progress
+
+
+@app.get("/api/myday/{date}")
+async def api_myday(date: str) -> JSONResponse:
+    """Comprehensive day view: calendar, tasks, activity, people, work status."""
+    cfg = _cfg()
+    vault = Path(cfg["obsidian_vault"])
+
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return JSONResponse({"error": "Invalid date format, use YYYY-MM-DD"}, status_code=400)
+
+    date_path = dt.strftime("%Y/%m/%d")
+
+    calendar_events: list[dict] = []
+    cal_file = vault / cfg["output"]["meetings"] / date_path / "calendar.md"
+    if cal_file.is_file():
+        calendar_events = _parse_calendar_md(
+            cal_file.read_text(encoding="utf-8", errors="replace")
+        )
+
+    recall_tasks: list[dict] = []
+    recall_dir = cfg["output"].get("recall", "87_recall")
+    recall_file = vault / recall_dir / date_path / "recall.md"
+    if recall_file.is_file():
+        recall_tasks = _parse_recall_md(
+            recall_file.read_text(encoding="utf-8", errors="replace")
+        )
+
+    activity_data: dict[str, Any] = {
+        "total_active_hours": 0, "total_context_switches": 0,
+        "app_breakdown": [], "hourly": {}, "context_switches_per_hour": {},
+    }
+    activity_file = vault / cfg["output"]["activity"] / date_path / "daily.md"
+    if activity_file.is_file():
+        from src.analyzers.activity_stats import parse_daily_activity
+        stats = parse_daily_activity(
+            activity_file.read_text(encoding="utf-8", errors="replace")
+        )
+        activity_data = {
+            "total_active_hours": stats.total_active_hours,
+            "total_context_switches": stats.total_context_switches,
+            "app_breakdown": stats.to_app_breakdown(),
+            "hourly": stats.hourly_app_minutes,
+            "context_switches_per_hour": stats.context_switches_per_hour,
+        }
+
+    audio_text = ""
+    audio_file = vault / cfg["output"]["meetings"] / date_path / "audio.md"
+    if audio_file.is_file():
+        audio_text = audio_file.read_text(encoding="utf-8", errors="replace")
+
+    people = _extract_people(calendar_events, audio_text)
+
+    work_completed, work_in_progress = _get_work_for_date(vault, dt)
+
+    has_data = bool(calendar_events or recall_tasks or activity_data["app_breakdown"] or people)
+
+    return JSONResponse({
+        "date": date,
+        "calendar": calendar_events,
+        "tasks": recall_tasks,
+        "activity": activity_data,
+        "people": people,
+        "work_completed": work_completed,
+        "work_in_progress": work_in_progress,
+        "has_data": has_data,
     })
 
 
@@ -1113,6 +1633,7 @@ SCHEDULED_SKILLS = {
     "focus-audit": "com.memoryos.focus-audit",
     "relationship-crm": "com.memoryos.relationship-crm",
     "team-manager": "com.memoryos.team-manager",
+    "approvals-queue": "com.memoryos.approvals-queue",
 }
 
 
@@ -1213,6 +1734,16 @@ async def api_agents_run_skill(skill_name: str, background_tasks: BackgroundTask
     started_at = time.time()
     _skill_jobs[skill_name] = {"status": "running", "started_at": started_at, "error": None}
 
+    runner_module = None
+    manifest_path = skill_dir / "manifest.yaml"
+    if manifest_path.is_file():
+        try:
+            _m = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+            if _m.get("runner") == "scripted" and _m.get("runner_module"):
+                runner_module = _m["runner_module"]
+        except Exception:
+            pass
+
     def _run() -> None:
         try:
             env = os.environ.copy()
@@ -1224,8 +1755,10 @@ async def api_agents_run_skill(skill_name: str, background_tasks: BackgroundTask
                     if line and not line.startswith("#") and "=" in line:
                         k, _, v = line.partition("=")
                         env.setdefault(k.strip(), v.strip())
+            cmd = [str(VENV_PYTHON), "-m", runner_module] if runner_module else \
+                  [str(VENV_PYTHON), "-m", "src.agents.skill_runner", "--skill", skill_name]
             result = subprocess.run(
-                [str(VENV_PYTHON), "-m", "src.agents.skill_runner", "--skill", skill_name],
+                cmd,
                 env=env, capture_output=True, text=True, timeout=600, cwd=str(REPO_DIR),
             )
             if result.returncode != 0:
@@ -1454,6 +1987,162 @@ async def api_agents_report(skill_name: str, date: str, request: Request) -> JSO
     return JSONResponse({"content": report_path.read_text(encoding="utf-8", errors="replace")})
 
 
+# ── Plan My Week: estimated-vs-actual enrichment ──
+
+_CALENDAR_MEETING_RE = re.compile(
+    r"^##\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2}):\s*(.+)",
+    re.MULTILINE,
+)
+
+
+def _parse_calendar_meetings(calendar_text: str) -> list[dict[str, Any]]:
+    """Extract meetings with start, end, title, and duration from calendar.md."""
+    meetings: list[dict[str, Any]] = []
+    for m in _CALENDAR_MEETING_RE.finditer(calendar_text):
+        start_s, end_s, title = m.group(1), m.group(2), m.group(3).strip()
+        try:
+            sh, sm = map(int, start_s.split(":"))
+            eh, em = map(int, end_s.split(":"))
+            dur_h = (eh * 60 + em - sh * 60 - sm) / 60.0
+        except ValueError:
+            dur_h = 0.0
+        if dur_h < 0:
+            dur_h = 0.0
+        meetings.append({"start": start_s, "end": end_s, "title": title, "hours": round(dur_h, 2)})
+    return meetings
+
+
+def _parse_audio_attendance(audio_text: str) -> list[str]:
+    """Extract meeting titles from audio.md transcript section headers."""
+    titles: list[str] = []
+    for m in _CALENDAR_MEETING_RE.finditer(audio_text):
+        titles.append(m.group(3).strip())
+    return titles
+
+
+def _enrich_plan_with_actuals(data: dict[str, Any], vault: Path, cfg: dict[str, Any]) -> None:
+    """Overlay actual vault data onto the baseline plan-my-week JSON (in-place)."""
+    today = datetime.now()
+    today_str = today.strftime("%Y/%m/%d")
+    meetings_base = cfg.get("output", {}).get("meetings", "10_meetings")
+    email_base = cfg.get("output", {}).get("email", "00_inbox")
+
+    total_actual_mtg = 0.0
+    total_actual_focus = 0.0
+    days_with_actuals = 0
+
+    for day in data.get("days", []):
+        date_str = day.get("date", "")
+        if not date_str:
+            continue
+
+        if date_str > today_str:
+            day["day_status"] = "future"
+            continue
+
+        is_today = date_str == today_str
+        day["day_status"] = "in_progress" if is_today else "completed"
+
+        cal_path = vault / meetings_base / date_str / "calendar.md"
+        audio_path = vault / meetings_base / date_str / "audio.md"
+        email_dir = vault / email_base / date_str
+
+        actual_meetings: list[dict[str, Any]] = []
+        if cal_path.is_file():
+            try:
+                actual_meetings = _parse_calendar_meetings(cal_path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+
+        if is_today:
+            now_minutes = today.hour * 60 + today.minute
+            actual_meetings = [m for m in actual_meetings if _time_to_min(m["start"]) < now_minutes]
+
+        attended: list[str] = []
+        if audio_path.is_file():
+            try:
+                attended = _parse_audio_attendance(audio_path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+
+        actual_mtg_hours = round(sum(m["hours"] for m in actual_meetings), 1)
+        actual_mtg_count = len(actual_meetings)
+        actual_mtg_names = [m["title"] for m in actual_meetings]
+        actual_attended = [t for t in attended if any(
+            _fuzzy_title_match(t, m["title"]) for m in actual_meetings
+        )] if actual_meetings else attended
+        actual_focus = round(max(0.0, 8.0 - actual_mtg_hours), 1)
+
+        email_count = 0
+        if email_dir.is_dir():
+            try:
+                email_count = sum(1 for _ in email_dir.rglob("*.md"))
+            except OSError:
+                pass
+
+        day["actual_meeting_hours"] = actual_mtg_hours
+        day["actual_meeting_count"] = actual_mtg_count
+        day["actual_meeting_names"] = actual_mtg_names
+        day["actual_meetings_attended"] = actual_attended
+        day["actual_focus_hours"] = actual_focus
+        day["actual_email_count"] = email_count
+
+        total_actual_mtg += actual_mtg_hours
+        total_actual_focus += actual_focus
+        days_with_actuals += 1
+
+    data["actual_total_meeting_hours"] = round(total_actual_mtg, 1)
+    data["actual_total_focus_hours"] = round(total_actual_focus, 1)
+    data["days_with_actuals"] = days_with_actuals
+
+    week_days = data.get("days", [])
+    total_days = len(week_days)
+    completed_days = sum(1 for d in week_days if d.get("day_status") == "completed")
+    in_progress = 1 if any(d.get("day_status") == "in_progress" for d in week_days) else 0
+    data["week_progress"] = {
+        "completed_days": completed_days,
+        "current_day": completed_days + in_progress,
+        "total_days": total_days,
+        "percent": round((completed_days + in_progress * 0.5) / max(total_days, 1) * 100),
+    }
+
+
+def _time_to_min(t: str) -> int:
+    """Convert 'HH:MM' to minutes since midnight."""
+    try:
+        h, m = map(int, t.split(":"))
+        return h * 60 + m
+    except (ValueError, AttributeError):
+        return 0
+
+
+def _fuzzy_title_match(audio_title: str, cal_title: str) -> bool:
+    """Check if two meeting titles refer to the same meeting (case-insensitive substring)."""
+    a = audio_title.lower().strip()
+    b = cal_title.lower().strip()
+    return a in b or b in a or a == b
+
+
+def _enrich_weekly_status_with_actuals(data: dict[str, Any], vault: Path, cfg: dict[str, Any]) -> None:
+    """Patch weekly-status daily_meetings with actual hours from vault calendar files."""
+    meetings_base = cfg.get("output", {}).get("meetings", "10_meetings")
+
+    for entry in data.get("daily_meetings", []):
+        date_str = entry.get("date", "")
+        if not date_str:
+            continue
+        vault_date = date_str.replace("-", "/")
+        cal_path = vault / meetings_base / vault_date / "calendar.md"
+        if not cal_path.is_file():
+            continue
+        try:
+            actual = _parse_calendar_meetings(cal_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        entry["hours"] = round(sum(m["hours"] for m in actual), 1)
+        entry["actual_count"] = len(actual)
+
+
 @app.get("/api/agents/reports/{skill_name}/{date}/json")
 async def api_agents_report_json(skill_name: str, date: str, request: Request) -> JSONResponse:
     """Return structured JSON report for rich dashboard rendering."""
@@ -1461,17 +2150,35 @@ async def api_agents_report_json(skill_name: str, date: str, request: Request) -
     vault = Path(cfg.get("obsidian_vault", "")).expanduser()
     reports_dir_name = cfg.get("agents", {}).get("reports_dir", "90_reports")
     json_path = vault / reports_dir_name / skill_name / f"{date}.json"
-    if not json_path.is_file():
+    md_path = vault / reports_dir_name / skill_name / f"{date}.md"
+
+    source_path: Path | None = json_path if json_path.is_file() else md_path if md_path.is_file() else None
+    if source_path is None:
         return JSONResponse({"error": "JSON report not found"}, status_code=404)
     after = request.query_params.get("after")
     if after:
         try:
-            if json_path.stat().st_mtime <= float(after):
+            if source_path.stat().st_mtime <= float(after):
                 return JSONResponse({"error": "Report not yet refreshed"}, status_code=404)
         except (ValueError, OSError):
             pass
     try:
-        data = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
+        data: dict[str, Any] | None = None
+        if source_path == json_path:
+            data = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
+        else:
+            md = md_path.read_text(encoding="utf-8", errors="replace")
+            embedded = extract_embedded_json(md)
+            if embedded:
+                data = normalize_report(skill_name, embedded, markdown=md)
+            elif skill_name == "project-brief":
+                data = parse_project_brief_markdown(md)
+        if not data:
+            return JSONResponse({"error": "JSON report not found"}, status_code=404)
+        if skill_name == "plan-my-week":
+            _enrich_plan_with_actuals(data, vault, cfg)
+        elif skill_name == "weekly-status":
+            _enrich_weekly_status_with_actuals(data, vault, cfg)
         return JSONResponse(data)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -1654,6 +2361,455 @@ async def api_knowledge_pin(request: Request) -> JSONResponse:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  API: Context Files (priorities.md, tasks.md)
+# ══════════════════════════════════════════════════════════════════════════════
+
+CONTEXT_DIR = "_context"
+CONTEXT_EDITABLE = {"priorities.md", "tasks.md"}
+
+
+@app.get("/api/context/file")
+async def api_context_file_get(name: str = "") -> JSONResponse:
+    """Read an editable context file (priorities.md or tasks.md)."""
+    if name not in CONTEXT_EDITABLE:
+        return JSONResponse({"error": f"Not editable: {name}"}, status_code=400)
+    cfg = _cfg()
+    vault = Path(cfg.get("obsidian_vault", "")).expanduser()
+    full = (vault / CONTEXT_DIR / name).resolve()
+    if not str(full).startswith(str(vault.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not full.is_file():
+        return JSONResponse({"name": name, "content": "", "exists": False})
+    try:
+        content = full.read_text(encoding="utf-8", errors="replace")
+        stat = full.stat()
+        return JSONResponse({
+            "name": name,
+            "content": content,
+            "exists": True,
+            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/context/file")
+async def api_context_file_post(request: Request) -> JSONResponse:
+    """Save edits to an editable context file."""
+    body = await request.json()
+    name = body.get("name", "")
+    content = body.get("content", "")
+    if name not in CONTEXT_EDITABLE:
+        return JSONResponse({"error": f"Not editable: {name}"}, status_code=400)
+    cfg = _cfg()
+    vault = Path(cfg.get("obsidian_vault", "")).expanduser()
+    full = (vault / CONTEXT_DIR / name).resolve()
+    if not str(full).startswith(str(vault.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content, encoding="utf-8")
+        return JSONResponse({"status": "ok"})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API: Structured Task Table (parses tasks.md + priorities.md <-> JSON)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TASK_RE = re.compile(
+    r"^- \[(?P<check>[ /xX])\]\s+"
+    r"(?P<desc>.+?)"
+    r"(?:\s+--\s+\*\*(?P<pri>P[012])\*\*)?"
+    r"(?:\s+--\s+(?:due|completed):\s*(?P<date>[A-Za-z0-9 ,]+))?"
+    r"(?:\s+//\s*(?P<notes>.+))?$"
+)
+_SUBTASK_RE = re.compile(
+    r"^  - \[(?P<check>[ /xX])\]\s+"
+    r"(?P<desc>.+?)"
+    r"(?:\s+--\s+\*\*(?P<pri>P[012])\*\*)?"
+    r"(?:\s+--\s+(?:due|completed):\s*(?P<date>[A-Za-z0-9 ,]+))?"
+    r"(?:\s+//\s*(?P<notes>.+))?$"
+)
+
+_STATUS_MAP = {" ": "not_started", "/": "in_progress", "x": "complete", "X": "complete"}
+_STATUS_TO_CHECK = {"not_started": " ", "in_progress": "/", "complete": "x",
+                    "waiting": " ", "blocked": " "}
+
+
+def _parse_tasks_md(content: str) -> dict:
+    """Parse tasks.md into structured data."""
+    projects: list[dict] = []
+    waiting: list[dict] = []
+    completed: list[dict] = []
+    backlog: list[dict] = []
+
+    section = "active"
+    current_project = ""
+    current_tasks: list[dict] = []
+    task_idx = 0
+    in_comment = False
+
+    for line in content.split("\n"):
+        if "<!--" in line:
+            in_comment = True
+        if "-->" in line:
+            in_comment = False
+            continue
+        if in_comment:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("## Active Tasks"):
+            section = "active"
+            continue
+        if stripped.startswith("## Waiting On Others"):
+            if current_project and current_tasks:
+                projects.append({"name": current_project, "tasks": current_tasks})
+                current_tasks = []
+                current_project = ""
+            section = "waiting"
+            continue
+        if stripped.startswith("## Completed"):
+            if current_project and current_tasks:
+                projects.append({"name": current_project, "tasks": current_tasks})
+                current_tasks = []
+                current_project = ""
+            section = "completed"
+            continue
+        if stripped.startswith("## Backlog"):
+            if current_project and current_tasks:
+                projects.append({"name": current_project, "tasks": current_tasks})
+                current_tasks = []
+                current_project = ""
+            section = "backlog"
+            continue
+
+        if section == "active" and stripped.startswith("### "):
+            if current_project and current_tasks:
+                projects.append({"name": current_project, "tasks": current_tasks})
+                current_tasks = []
+            current_project = stripped[4:].strip()
+            continue
+
+        sm = _SUBTASK_RE.match(line)
+        if sm:
+            task_idx += 1
+            sub: dict[str, Any] = {
+                "id": f"t{task_idx}",
+                "task": sm.group("desc").strip(),
+                "status": _STATUS_MAP.get(sm.group("check"), "not_started"),
+                "priority": sm.group("pri") or "P1",
+                "due": sm.group("date") or "",
+                "notes": sm.group("notes") or "",
+                "section": section,
+            }
+            parent = current_tasks[-1] if current_tasks else None
+            if parent:
+                parent.setdefault("subtasks", []).append(sub)
+            continue
+
+        m = _TASK_RE.match(stripped)
+        if m:
+            task_idx += 1
+            task: dict[str, Any] = {
+                "id": f"t{task_idx}",
+                "task": m.group("desc").strip(),
+                "status": _STATUS_MAP.get(m.group("check"), "not_started"),
+                "priority": m.group("pri") or "P1",
+                "due": m.group("date") or "",
+                "notes": m.group("notes") or "",
+                "section": section,
+                "subtasks": [],
+            }
+            if section == "active":
+                current_tasks.append(task)
+            elif section == "completed":
+                completed.append(task)
+            elif section == "backlog":
+                backlog.append(task)
+            continue
+
+        if section == "waiting" and stripped.startswith("|") and "---" not in stripped:
+            cells = [c.strip() for c in stripped.split("|")]
+            cells = [c for c in cells if c]
+            if len(cells) >= 2 and cells[0] not in ("Who", "") and not cells[0].startswith("<!--"):
+                waiting.append({
+                    "who": cells[0], "what": cells[1] if len(cells) > 1 else "",
+                    "since": cells[2] if len(cells) > 2 else "",
+                    "followup": cells[3] if len(cells) > 3 else "",
+                })
+
+    if current_project and current_tasks:
+        projects.append({"name": current_project, "tasks": current_tasks})
+
+    return {"projects": projects, "waiting": waiting, "completed": completed, "backlog": backlog}
+
+
+def _parse_priorities_md(content: str) -> list[dict]:
+    """Parse priorities.md into a list of priority objects."""
+    priorities: list[dict] = []
+    current: dict[str, Any] | None = None
+
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            if current:
+                priorities.append(current)
+            name = re.sub(r"^\d+\.\s*", "", stripped[4:]).strip()
+            current = {"name": name, "owner": "", "goal": "", "status": "",
+                        "deadline": "", "dependencies": ""}
+            continue
+        if current and stripped.startswith("- **"):
+            kv = stripped[2:]
+            if kv.startswith("**Owner:**"):
+                current["owner"] = kv.split(":**", 1)[1].strip()
+            elif kv.startswith("**Goal:**"):
+                current["goal"] = kv.split(":**", 1)[1].strip()
+            elif kv.startswith("**Status:**"):
+                current["status"] = kv.split(":**", 1)[1].strip()
+            elif kv.startswith("**Deadline:**"):
+                current["deadline"] = kv.split(":**", 1)[1].strip()
+            elif kv.startswith("**Dependencies:**"):
+                current["dependencies"] = kv.split(":**", 1)[1].strip()
+
+    if current:
+        priorities.append(current)
+    return priorities
+
+
+def _serialize_tasks_md(data: dict) -> str:
+    """Serialize structured data back to tasks.md markdown."""
+    lines = [
+        "# Task List", "",
+        f"*Last updated: {datetime.now().strftime('%Y-%m-%d')} via dashboard.*", "",
+        "<!-- Conventions:",
+        "  - [ ] Not started",
+        "  - [/] In progress",
+        '  - [x] Complete -- add "completed: {date}"',
+        '  Progress notes: append "// {note}" to any task',
+        "  Priority: **P0** (today/urgent), **P1** (this week), **P2** (later)",
+        '  Move blocked items to "Waiting On Others" with who/since/follow-up',
+        "  Examples:",
+        "  - [ ] New task -- **P1** -- due: Mar 5",
+        "  - [/] Started task -- **P1** -- due: Mar 5 // met with team, drafting doc",
+        "  - [x] Done task -- **P1** -- completed: Feb 25",
+        "-->", "",
+        "## Active Tasks", "",
+    ]
+
+    for proj in data.get("projects", []):
+        lines.append(f"### {proj['name']}")
+        for t in proj.get("tasks", []):
+            lines.append(_task_to_line(t))
+            for st in t.get("subtasks", []):
+                lines.append(_task_to_line(st, indent=1))
+        lines.append("")
+
+    lines.append("## Waiting On Others")
+    lines.append("")
+    lines.append("| Who | What | Since | Follow-up |")
+    lines.append("|-----|------|-------|-----------|")
+    for w in data.get("waiting", []):
+        lines.append(f"| {w.get('who','')} | {w.get('what','')} | {w.get('since','')} | {w.get('followup','')} |")
+    if not data.get("waiting"):
+        lines.append("| <!-- e.g. Eva | Updated data model | Feb 18 | Ping Thursday --> |")
+    lines.append("")
+
+    lines.append("## Completed (last 7 days)")
+    lines.append("")
+    if data.get("completed"):
+        for t in data["completed"]:
+            lines.append(_task_to_line(t))
+    else:
+        lines.append("- *(none yet)*")
+    lines.append("")
+
+    lines.append("## Backlog")
+    lines.append("")
+    if data.get("backlog"):
+        for t in data["backlog"]:
+            lines.append(_task_to_line(t))
+    else:
+        lines.append("- *(add lower-priority or future tasks here)*")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _task_to_line(t: dict, indent: int = 0) -> str:
+    check = _STATUS_TO_CHECK.get(t.get("status", "not_started"), " ")
+    pri = t.get("priority", "P1")
+    due = t.get("due", "")
+    notes = t.get("notes", "")
+    desc = t.get("task", "")
+    parts = [f"- [{check}] {desc}"]
+    if pri:
+        parts.append(f"**{pri}**")
+    if due:
+        prefix = "completed" if t.get("status") == "complete" else "due"
+        parts.append(f"{prefix}: {due}")
+    line = " -- ".join(parts)
+    if notes:
+        line += f" // {notes}"
+    return ("  " * indent) + line
+
+
+@app.get("/api/tasks")
+async def api_tasks_get() -> JSONResponse:
+    """Return structured task data parsed from tasks.md + priorities.md."""
+    cfg = _cfg()
+    vault = Path(cfg.get("obsidian_vault", "")).expanduser()
+    tasks_path = vault / CONTEXT_DIR / "tasks.md"
+    pri_path = vault / CONTEXT_DIR / "priorities.md"
+
+    tasks_content = ""
+    if tasks_path.is_file():
+        tasks_content = tasks_path.read_text(encoding="utf-8", errors="replace")
+    pri_content = ""
+    if pri_path.is_file():
+        pri_content = pri_path.read_text(encoding="utf-8", errors="replace")
+
+    task_data = _parse_tasks_md(tasks_content)
+    priorities = _parse_priorities_md(pri_content)
+
+    pri_map: dict[str, dict] = {}
+    for p in priorities:
+        pri_map[p["name"]] = p
+        base = re.sub(r"\s*\(.*?\)\s*$", "", p["name"])
+        if base != p["name"]:
+            pri_map[base] = p
+
+    for proj in task_data["projects"]:
+        pri = pri_map.get(proj["name"], {})
+        if not pri:
+            base = re.sub(r"\s*\(.*?\)\s*$", "", proj["name"])
+            pri = pri_map.get(base, {})
+        proj["owner"] = pri.get("owner", "")
+        proj["goal"] = pri.get("goal", "")
+        proj["priority_status"] = pri.get("status", "")
+        for t in proj.get("tasks", []):
+            if not t.get("owner"):
+                t["owner"] = pri.get("owner", "")
+
+    return JSONResponse({
+        **task_data,
+        "priorities": priorities,
+        "project_names": [p["name"] for p in priorities],
+    })
+
+
+@app.post("/api/tasks")
+async def api_tasks_post(request: Request) -> JSONResponse:
+    """Save structured task data back to tasks.md (and update priorities.md status)."""
+    body = await request.json()
+    cfg = _cfg()
+    vault = Path(cfg.get("obsidian_vault", "")).expanduser()
+    tasks_path = (vault / CONTEXT_DIR / "tasks.md").resolve()
+    pri_path = (vault / CONTEXT_DIR / "priorities.md").resolve()
+    vault_resolved = vault.resolve()
+
+    if not str(tasks_path).startswith(str(vault_resolved)):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+
+    try:
+        md = _serialize_tasks_md(body)
+        tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        tasks_path.write_text(md, encoding="utf-8")
+
+        if pri_path.is_file() and str(pri_path).startswith(str(vault_resolved)):
+            pri_content = pri_path.read_text(encoding="utf-8", errors="replace")
+            for proj in body.get("projects", []):
+                tasks = proj.get("tasks", [])
+                if not tasks:
+                    continue
+                all_done = all(t.get("status") == "complete" for t in tasks)
+                any_progress = any(t.get("status") in ("in_progress", "complete") for t in tasks)
+                if all_done:
+                    new_status = "Complete"
+                elif any_progress:
+                    new_status = "In progress"
+                else:
+                    new_status = None
+                if new_status:
+                    pattern = re.compile(
+                        r"(###\s+\d*\.?\s*" + re.escape(proj["name"]) + r".*?\n(?:.*?\n)*?- \*\*Status:\*\*)\s+.*",
+                        re.MULTILINE,
+                    )
+                    pri_content = pattern.sub(r"\1 " + new_status, pri_content, count=1)
+            pri_path.write_text(pri_content, encoding="utf-8")
+
+        return JSONResponse({"status": "ok"})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API: Approvals Queue (manual actions)
+# ══════════════════════════════════════════════════════════════════════════════
+
+APPROVALS_STATE_FILE = REPO_DIR / "config" / "approvals_state.json"
+
+
+def _load_approvals_state() -> dict[str, Any]:
+    if APPROVALS_STATE_FILE.is_file():
+        try:
+            return json.loads(APPROVALS_STATE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"items": {}, "last_email_scan": None, "last_evidence_scan_frame_id": 0}
+
+
+def _save_approvals_state(state: dict[str, Any]) -> None:
+    APPROVALS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = APPROVALS_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    tmp.rename(APPROVALS_STATE_FILE)
+
+
+@app.get("/api/approvals/state")
+async def api_approvals_state() -> JSONResponse:
+    """Return current approvals queue state."""
+    return JSONResponse(_load_approvals_state())
+
+
+@app.post("/api/approvals/action")
+async def api_approvals_action(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
+    """Manually mark an approval as approved or dismissed."""
+    body = await request.json()
+    approval_id = body.get("approval_id", "")
+    action = body.get("action", "")
+
+    if action not in ("approved", "dismissed"):
+        return JSONResponse({"error": "action must be 'approved' or 'dismissed'"}, status_code=400)
+
+    state = _load_approvals_state()
+    item = state.get("items", {}).get(approval_id)
+    if not item:
+        return JSONResponse({"error": f"Item not found: {approval_id}"}, status_code=404)
+
+    item["status"] = action
+    item["status_changed_at"] = datetime.now().isoformat(timespec="seconds")
+    if action == "approved" and not item.get("evidence"):
+        item["evidence"] = {"timestamp": item["status_changed_at"], "url": "", "snippet": "Manual approval via dashboard"}
+    state["items"][approval_id] = item
+    _save_approvals_state(state)
+
+    def _regen_report() -> None:
+        try:
+            from src.monitor.approvals_monitor import generate_report, load_approvals_state as _load
+            cfg = _cfg()
+            vault = Path(cfg.get("obsidian_vault", "")).expanduser()
+            fresh = _load()
+            generate_report(fresh, vault, cfg)
+        except Exception as exc:
+            logger.error("Approvals report regen failed: %s", exc)
+
+    background_tasks.add_task(_regen_report)
+    return JSONResponse({"status": "ok", "approval_id": approval_id, "new_status": action})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HTML Dashboard — Full Control Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1747,6 +2903,26 @@ body {
 .priv-dot.on { background: var(--red); box-shadow: 0 0 8px rgba(248,113,113,.5); }
 .priv-dot.off { background: var(--green); box-shadow: 0 0 8px rgba(74,222,128,.5); }
 
+/* ── Audio device picker ── */
+.audio-device-picker {
+  display: flex; align-items: center; gap: 6px;
+}
+.audio-device-picker select {
+  padding: 6px 10px; border-radius: 8px; font-size: .83rem;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  cursor: pointer; max-width: 220px;
+}
+.audio-device-picker select:disabled { opacity: .5; cursor: default; }
+.btn-icon {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--muted); cursor: pointer; font-size: 1rem; padding: 4px 7px;
+  line-height: 1; transition: color .2s;
+}
+.btn-icon:hover { color: var(--text); }
+.audio-device-msg {
+  font-size: .78rem; font-weight: 600; transition: opacity .3s;
+}
+
 /* ── Agents table ── */
 .agent-row {
   display: flex; justify-content: space-between; align-items: center;
@@ -1819,6 +2995,50 @@ body {
 /* ── File Browser ── */
 .browser-layout { display: grid; grid-template-columns: 340px 1fr; gap: 16px; min-height: 600px; }
 @media (max-width: 900px) { .browser-layout { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { #mywork-grid { grid-template-columns: 1fr !important; } }
+
+/* ── Task Table ── */
+.mw-topbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+.mw-toggle { display:inline-flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+.mw-toggle button { padding:6px 14px; font-size:.8rem; font-weight:500; border:none; background:transparent; color:var(--muted); cursor:pointer; }
+.mw-toggle button.active { background:var(--accent); color:#fff; }
+.mw-filters { display:flex; gap:8px; align-items:center; margin-left:auto; }
+.mw-filters select { padding:4px 8px; font-size:.78rem; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text); }
+.task-proj-hdr { display:flex; align-items:center; gap:10px; padding:10px 14px; background:var(--surface2); border-bottom:1px solid var(--border); cursor:pointer; user-select:none; }
+.task-proj-hdr .proj-name { font-size:.82rem; font-weight:600; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); }
+.task-proj-hdr .proj-meta { font-size:.74rem; color:var(--muted); margin-left:auto; }
+.task-proj-hdr .proj-toggle { font-size:.7rem; color:var(--muted); transition:transform .15s; }
+.task-proj-hdr .proj-toggle.collapsed { transform:rotate(-90deg); }
+.task-proj-hdr .proj-edit-btn { background:none; border:none; color:var(--muted); cursor:pointer; font-size:.72rem; padding:2px 4px; border-radius:4px; opacity:.4; }
+.task-proj-hdr .proj-edit-btn:hover { opacity:1; color:var(--accent); }
+.task-proj-hdr .proj-owner-lbl { cursor:pointer; border-bottom:1px dashed transparent; }
+.task-proj-hdr .proj-owner-lbl:hover { border-bottom-color:var(--accent); color:var(--text); }
+.task-row { display:grid; grid-template-columns:1fr 110px 70px 110px 105px 1fr 36px; gap:0; padding:6px 10px; border-bottom:1px solid var(--border); align-items:center; font-size:.82rem; }
+.task-row input, .task-row select { padding:4px 6px; font-size:.78rem; border-radius:5px; border:1px solid transparent; background:transparent; color:var(--text); width:100%; }
+.task-row input:hover, .task-row select:hover { border-color:var(--border); }
+.task-row input:focus, .task-row select:focus { border-color:var(--accent); background:var(--bg); outline:none; }
+.task-row .task-del { background:none; border:none; color:var(--muted); cursor:pointer; font-size:.9rem; padding:2px 6px; border-radius:4px; }
+.task-row .task-del:hover { color:var(--red); background:rgba(248,113,113,.1); }
+.task-hdr { display:grid; grid-template-columns:1fr 110px 70px 110px 105px 1fr 36px; gap:0; padding:6px 10px; font-size:.72rem; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; border-bottom:2px solid var(--border); }
+.task-bottom { display:flex; gap:12px; align-items:center; margin-top:16px; }
+.task-counts { font-size:.8rem; color:var(--muted); margin-left:auto; }
+.task-counts span { margin-right:12px; }
+select.pri-p0 { color:var(--red); } select.pri-p1 { color:var(--yellow); } select.pri-p2 { color:var(--muted); }
+select.st-not_started { color:var(--muted); } select.st-in_progress { color:var(--blue); } select.st-complete { color:var(--green); } select.st-waiting { color:var(--orange); } select.st-blocked { color:var(--red); }
+.task-row input.overdue { color:var(--red); font-weight:600; }
+.task-row.subtask { padding-left:36px; background:rgba(255,255,255,.015); border-left:2px solid var(--accent); }
+.task-row .task-actions { display:flex; gap:2px; align-items:center; }
+.task-row .task-add-sub { background:none; border:none; color:var(--muted); cursor:pointer; font-size:.72rem; padding:2px 5px; border-radius:4px; opacity:.5; }
+.task-row .task-add-sub:hover { color:var(--accent); background:rgba(99,102,241,.1); opacity:1; }
+@media (max-width: 900px) {
+  .task-row, .task-hdr { grid-template-columns: 1fr !important; gap:4px; }
+  .task-hdr { display:none; }
+  .task-row { padding:12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; }
+  .task-row input, .task-row select { border-color:var(--border); background:var(--bg); }
+  .task-row > *::before { content:attr(data-label); display:block; font-size:.68rem; color:var(--muted); text-transform:uppercase; margin-bottom:2px; }
+  .mw-filters { margin-left:0; width:100%; }
+}
+
 .browser-sidebar { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
 .browser-breadcrumb { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: .8rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px; }
 .browser-breadcrumb a { color: var(--accent); text-decoration: none; cursor: pointer; }
@@ -2006,7 +3226,7 @@ body {
 .rv-metric-label { font-size: .78rem; color: var(--muted); margin-top: 4px; }
 
 /* Hero image */
-.rv-hero { width: 100%; border-radius: 14px; margin-bottom: 24px; object-fit: cover; max-height: 320px; object-position: center 30%; }
+.rv-hero { width: 100%; border-radius: 14px; margin-bottom: 24px; object-fit: contain; max-height: 420px; }
 
 /* Section headers */
 .rv-section { margin-bottom: 28px; }
@@ -2124,6 +3344,77 @@ body {
 .rv-day-density-light { border-top: 3px solid var(--green); }
 .rv-day-density-moderate { border-top: 3px solid #facc15; }
 .rv-day-density-heavy { border-top: 3px solid var(--red); }
+
+/* Day status indicators (estimated vs actual) */
+.rv-day-status {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%; margin: 6px auto 2px; font-size: .7rem;
+}
+.rv-day-status-completed { background: var(--green); color: #000; }
+.rv-day-status-completed::after { content: '\2713'; }
+.rv-day-status-today {
+  background: var(--accent); animation: pulseDay 2s ease-in-out infinite;
+}
+.rv-day-status-today::after { content: '\25CF'; color: #fff; font-size: .5rem; }
+@keyframes pulseDay { 0%,100% { opacity:1; box-shadow: 0 0 0 0 rgba(108,124,255,.4); } 50% { opacity:.8; box-shadow: 0 0 0 6px rgba(108,124,255,0); } }
+.rv-day-status-future { background: var(--border); }
+
+.rv-day-actual {
+  font-size: .68rem; color: var(--muted); margin-top: 4px;
+  border-top: 1px dashed var(--border); padding-top: 4px;
+}
+.rv-day-actual-val { font-weight: 600; }
+.rv-day-actual-good { color: var(--green); }
+.rv-day-actual-bad { color: var(--red); }
+
+/* Week progress bar */
+.rv-week-progress {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 20px; margin-bottom: 20px; display: flex; align-items: center; gap: 16px;
+}
+.rv-week-progress-label { font-size: .84rem; font-weight: 600; color: var(--text); white-space: nowrap; }
+.rv-week-progress-track {
+  flex: 1; height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; position: relative;
+}
+.rv-week-progress-fill {
+  height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--accent), var(--green));
+  transition: width .5s ease;
+}
+.rv-week-progress-pct { font-size: .78rem; color: var(--muted); white-space: nowrap; }
+
+/* Estimated vs Actual metrics */
+.rv-metric-compare {
+  display: flex; gap: 8px; align-items: baseline; justify-content: center;
+  margin-top: 4px; font-size: .74rem;
+}
+.rv-metric-planned { color: var(--muted); }
+.rv-metric-actual { font-weight: 600; }
+.rv-metric-delta { font-size: .68rem; margin-left: 2px; }
+.rv-metric-delta-good { color: var(--green); }
+.rv-metric-delta-bad { color: var(--red); }
+
+/* Gantt actual bars */
+.rv-gantt-actual-bar {
+  height: 60%; border-radius: 4px; position: absolute; bottom: 2px;
+  opacity: .7; border: 1px dashed rgba(255,255,255,.3);
+}
+.rv-gantt-today-marker {
+  position: absolute; top: -4px; bottom: -4px; width: 2px;
+  background: var(--accent); z-index: 2;
+}
+.rv-gantt-today-marker::before {
+  content: 'Today'; position: absolute; top: -16px; left: 50%;
+  transform: translateX(-50%); font-size: .58rem; color: var(--accent);
+  white-space: nowrap; font-weight: 600;
+}
+.rv-gantt-row { position: relative; }
+.rv-gantt-legend {
+  display: flex; gap: 16px; margin-top: 8px; font-size: .7rem; color: var(--muted);
+}
+.rv-gantt-legend-dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px;
+  vertical-align: middle;
+}
 
 /* Gantt-like deliverable bars */
 .rv-gantt { margin-bottom: 24px; }
@@ -2273,6 +3564,537 @@ body {
 
 /* ═══ Animated Counter ═══ */
 .rv-counter { transition:all .3s; }
+
+/* ═══ PDF Download Button ═══ */
+.pdf-btn {
+  background: var(--accent); color: #fff; border: none; border-radius: 8px;
+  padding: 8px 18px; font-size: .82rem; font-weight: 600; cursor: pointer;
+  transition: opacity .15s; margin-left: auto;
+}
+.pdf-btn:hover { opacity: .85; }
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* EXECUTIVE DESIGN SYSTEM                                                   */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Light Theme Variables (for PDF / Report pages) ── */
+.exec-light {
+  --bg: #FFFFFF; --surface: #F8F9FB; --surface2: #F0F1F5; --border: #E5E7EB;
+  --text: #111827; --muted: #6B7280; --accent: #4F46E5;
+  --green: #059669; --yellow: #D97706; --red: #DC2626; --blue: #2563EB;
+  --orange: #EA580C;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1);
+  --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1);
+}
+.exec-light body, .exec-light .report-body {
+  color: var(--text); background: var(--bg);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
+}
+.exec-light .report-header {
+  background: #1E1B4B; color: #fff; border-bottom: none;
+  padding: 20px 32px;
+}
+.exec-light .report-header h1 { color: #fff; font-size: 1.4rem; letter-spacing: -0.3px; }
+.exec-light .report-header .date { color: rgba(255,255,255,0.7); }
+.exec-light .rv-metric {
+  background: var(--surface); border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm); border-radius: 12px;
+}
+.exec-light .rv-metric-value { color: var(--text); }
+.exec-light .rv-card {
+  background: #fff; border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm); border-radius: 12px;
+}
+.exec-light .rv-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
+.exec-light .rv-section-title { color: var(--text); border-color: var(--border); }
+.exec-light .rv-analysis {
+  background: linear-gradient(135deg, rgba(79,70,229,0.06), rgba(79,70,229,0.02));
+  border-color: rgba(79,70,229,0.2);
+}
+.exec-light .rv-chart-container {
+  background: #fff; border: 1px solid var(--border); box-shadow: var(--shadow-sm);
+}
+.exec-light .rv-kanban-col {
+  background: var(--surface); border: 1px solid var(--border);
+}
+.exec-light .rv-kanban-item {
+  background: #fff; border: 1px solid var(--border); box-shadow: var(--shadow-sm);
+}
+.exec-light .np-card {
+  background: #fff; border: 1px solid var(--border); box-shadow: var(--shadow-sm);
+}
+.exec-light .np-editorial { color: var(--muted); }
+.exec-light .rv-gauge-value { color: var(--text); }
+.exec-light .rv-gauge-sub { color: var(--muted); }
+.exec-light .rv-energy-slot[data-tip]:hover::after {
+  background: #fff; border-color: var(--border); color: var(--text);
+}
+
+/* ── Executive Header Component ── */
+.exec-header {
+  position: relative; margin-bottom: 28px; border-radius: 16px; overflow: hidden;
+}
+.exec-header-hero {
+  width: 100%; height: 200px; object-fit: cover; display: block;
+  filter: brightness(0.5);
+}
+.exec-header-overlay {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(180deg, rgba(17,24,39,0.3) 0%, rgba(17,24,39,0.85) 100%);
+  display: flex; flex-direction: column; justify-content: flex-end; padding: 24px 28px;
+}
+.exec-header-no-hero {
+  background: linear-gradient(135deg, #1E1B4B 0%, #312E81 50%, #1E1B4B 100%);
+  padding: 28px 32px; border-radius: 16px;
+}
+.exec-header-bluf {
+  font-size: 1.15rem; font-weight: 600; color: #fff; line-height: 1.45;
+  letter-spacing: -0.2px; max-width: 800px;
+}
+.exec-header-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px; border-radius: 20px; font-size: .72rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
+}
+.exec-header-status-green { background: rgba(5,150,105,0.25); color: #34D399; }
+.exec-header-status-yellow { background: rgba(217,119,6,0.25); color: #FBBF24; }
+.exec-header-status-red { background: rgba(220,38,38,0.25); color: #FCA5A5; }
+.exec-header-metrics {
+  display: flex; gap: 16px; margin-top: 20px; flex-wrap: wrap;
+}
+.exec-header-kpi {
+  background: rgba(255,255,255,0.08); backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 12px;
+  padding: 14px 20px; min-width: 120px; text-align: center;
+  transition: transform 0.15s, background 0.15s;
+}
+.exec-header-kpi:hover { transform: translateY(-2px); background: rgba(255,255,255,0.12); }
+.exec-header-kpi-value {
+  font-size: 1.8rem; font-weight: 800; color: #fff; line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.exec-header-kpi-label {
+  font-size: .7rem; color: rgba(255,255,255,0.65); margin-top: 4px;
+  text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+}
+.exec-header-kpi-trend {
+  font-size: .72rem; font-weight: 700; margin-top: 4px;
+}
+.exec-header-kpi-trend-up { color: #34D399; }
+.exec-header-kpi-trend-down { color: #FCA5A5; }
+
+/* Light-theme executive header adjustments */
+.exec-light .exec-header-no-hero {
+  background: linear-gradient(135deg, #1E1B4B 0%, #312E81 50%, #1E1B4B 100%);
+}
+
+/* ── Three Moves / Action Cards ── */
+.exec-moves {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 14px; margin-bottom: 28px;
+}
+.exec-move {
+  background: linear-gradient(135deg, rgba(79,70,229,0.08), rgba(79,70,229,0.02));
+  border: 1px solid rgba(79,70,229,0.2); border-radius: 14px;
+  padding: 18px 20px; position: relative;
+}
+.exec-light .exec-move {
+  background: linear-gradient(135deg, rgba(79,70,229,0.06), rgba(79,70,229,0.02));
+  box-shadow: var(--shadow-sm);
+}
+.exec-move-num {
+  width: 28px; height: 28px; border-radius: 50%; background: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: .8rem; font-weight: 800; margin-bottom: 10px;
+}
+.exec-move-title { font-weight: 700; font-size: .92rem; margin-bottom: 4px; }
+.exec-move-detail { font-size: .82rem; color: var(--muted); line-height: 1.45; }
+.exec-move-time {
+  display: inline-block; margin-top: 8px; padding: 2px 10px;
+  background: rgba(79,70,229,0.12); color: var(--accent);
+  border-radius: 10px; font-size: .68rem; font-weight: 600;
+}
+
+/* ── Talking Points Callout ── */
+.exec-talking-points {
+  background: linear-gradient(135deg, rgba(37,99,235,0.08), rgba(37,99,235,0.02));
+  border: 1px solid rgba(37,99,235,0.2); border-radius: 14px;
+  padding: 20px 24px; margin-bottom: 28px;
+}
+.exec-talking-points-title {
+  font-size: .72rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--blue); margin-bottom: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.exec-talking-point {
+  font-size: .88rem; line-height: 1.55; padding: 8px 0;
+  border-bottom: 1px solid rgba(37,99,235,0.1);
+}
+.exec-talking-point:last-child { border-bottom: none; }
+
+/* ── Stakeholder Heat Map ── */
+.exec-stakeholder-heat {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px; margin-bottom: 24px;
+}
+.exec-stakeholder-card {
+  border-radius: 12px; padding: 14px; text-align: center;
+  border: 1px solid var(--border); transition: transform 0.15s;
+}
+.exec-stakeholder-card:hover { transform: translateY(-2px); }
+.exec-stakeholder-name { font-weight: 700; font-size: .86rem; margin-bottom: 4px; }
+.exec-stakeholder-count {
+  font-size: 1.6rem; font-weight: 800; line-height: 1;
+}
+.exec-stakeholder-label { font-size: .68rem; color: var(--muted); margin-top: 4px; }
+
+/* ── Decision Needed Cards ── */
+.exec-decision-card {
+  background: linear-gradient(135deg, rgba(220,38,38,0.06), rgba(220,38,38,0.02));
+  border: 1px solid rgba(220,38,38,0.2); border-radius: 14px;
+  padding: 18px 20px; margin-bottom: 12px;
+}
+.exec-decision-title {
+  font-weight: 700; font-size: .92rem; display: flex; align-items: center; gap: 8px;
+}
+.exec-decision-detail { font-size: .84rem; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+.exec-decision-action {
+  margin-top: 10px; padding: 8px 14px; background: rgba(220,38,38,0.08);
+  border-radius: 8px; font-size: .82rem; font-weight: 600; color: var(--red);
+}
+
+/* ── Aging Bar ── */
+.exec-aging-bar {
+  display: flex; align-items: center; gap: 8px; margin-top: 6px;
+}
+.exec-aging-track {
+  flex: 1; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden;
+}
+.exec-aging-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+.exec-aging-label { font-size: .68rem; color: var(--muted); white-space: nowrap; }
+
+/* ── Milestone Runway (horizontal cross-project) ── */
+.exec-runway {
+  position: relative; padding: 20px 0; margin-bottom: 24px;
+  overflow-x: auto;
+}
+.exec-runway-track {
+  height: 4px; background: var(--border); border-radius: 2px;
+  position: relative; min-width: 600px;
+}
+.exec-runway-item {
+  position: absolute; top: -8px; transform: translateX(-50%);
+  display: flex; flex-direction: column; align-items: center;
+}
+.exec-runway-dot {
+  width: 20px; height: 20px; border-radius: 50%; border: 3px solid;
+  background: var(--bg); z-index: 1;
+}
+.exec-runway-label {
+  font-size: .68rem; font-weight: 600; margin-top: 8px; text-align: center;
+  max-width: 100px; line-height: 1.3;
+}
+.exec-runway-date { font-size: .62rem; color: var(--muted); }
+.exec-runway-project { font-size: .58rem; color: var(--accent); font-weight: 600; }
+
+/* ═══ Print / PDF Styles ═══ */
+@page {
+  size: A4; margin: 18mm 15mm 20mm 15mm;
+}
+@page :first { margin-top: 0; }
+
+@media print {
+  html, body {
+    background: #fff !important; color: #111 !important;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    font-size: 11pt; line-height: 1.5;
+  }
+
+  .top-tabs, .pdf-btn, .rich-view-back, .report-header button.pdf-btn,
+  .rv-filter-bar, .rich-view-header button, .exec-light-toggle { display: none !important; }
+
+  .rich-view-overlay { position: static !important; background: #fff !important; overflow: visible !important; }
+  .rich-view-overlay.open { display: block !important; }
+  .rich-view-body, .report-body { padding: 8px !important; max-width: 100% !important; }
+
+  /* Page break control */
+  .rv-card, .rv-section, .rv-kanban-col, .rv-chart-container, .rv-analysis,
+  .rv-quick-win, .rv-milestone, .rv-team-member, .exec-move, .exec-decision-card,
+  .exec-stakeholder-card { break-inside: avoid; }
+  .rv-section { break-before: auto; }
+  .exec-header { break-after: avoid; }
+  .exec-header + .rv-metrics, .exec-header + .exec-moves { break-before: avoid; }
+
+  /* Light theme override for print */
+  :root {
+    --bg: #fff; --surface: #f8f9fb; --surface2: #f0f1f5; --border: #e5e7eb;
+    --text: #111827; --muted: #6b7280; --accent: #4F46E5;
+    --green: #059669; --yellow: #D97706; --red: #DC2626; --blue: #2563EB;
+    --orange: #EA580C;
+  }
+
+  .rv-metrics { flex-wrap: wrap; }
+  .rv-metric { border: 1px solid #e5e7eb; background: #f8f9fb; box-shadow: none; }
+  .rv-metric-value { color: #111827; }
+  .rv-card { border: 1px solid #e5e7eb; background: #fff; box-shadow: none; }
+  .rv-card:hover { border-color: #e5e7eb; box-shadow: none; }
+  .rv-hero { max-height: 180px; border-radius: 12px; }
+  .rv-network { height: 200px; }
+  .rv-heatmap-cell { border: 1px solid rgba(0,0,0,.05); }
+
+  .rv-chart-container { background: #fff; border: 1px solid #e5e7eb; box-shadow: none; }
+  .rv-analysis { background: #f8f9fb; border: 1px solid #e5e7eb; }
+  .rv-kanban-col { background: #f8f9fb; border: 1px solid #e5e7eb; }
+  .rv-kanban-item { background: #fff; box-shadow: none; }
+
+  .np-card { flex-direction: column !important; gap: 0 !important; background: #f8f9fb !important;
+    border: 1px solid #e5e7eb !important; page-break-inside: avoid; box-shadow: none !important; }
+  .np-card .np-card-expand { display: block !important; }
+  .np-card .np-card-snippet { display: none !important; }
+  .np-card-hero { max-height: 160px; }
+
+  /* Executive header print adjustments */
+  .exec-header-no-hero { background: #1E1B4B !important; }
+  .exec-header-kpi { background: rgba(255,255,255,0.1) !important; border-color: rgba(255,255,255,0.15) !important; }
+  .exec-move { background: #f8f9fb; border: 1px solid #e5e7eb; box-shadow: none; }
+  .exec-talking-points { background: #f8f9fb; border: 1px solid #e5e7eb; }
+  .exec-decision-card { background: #fff8f8; border: 1px solid #fecaca; }
+
+  canvas { max-width: 100%; height: auto !important; }
+
+  .report-header {
+    background: #1E1B4B !important; color: #fff !important;
+    padding: 16px 24px; margin: -18mm -15mm 16px -15mm; width: calc(100% + 30mm);
+  }
+  .rich-view-header { border-bottom: 2px solid #4F46E5; padding: 12px 0; }
+
+  /* Page footer */
+  .report-footer-print {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    font-size: 8pt; color: #9ca3af; padding: 8px 15mm;
+    border-top: 1px solid #e5e7eb;
+    display: flex; justify-content: space-between;
+  }
+}
+
+/* Hide footer in screen mode */
+.report-footer-print { display: none; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   MY DAY TAB
+   ══════════════════════════════════════════════════════════════════════════ */
+
+#pane-myday { overflow-y: auto; }
+.md-header { margin-bottom: 20px; }
+.md-health-indicator {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: .75rem; font-weight: 600; padding: 3px 10px; border-radius: 12px;
+}
+.md-health-indicator .md-hdot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+}
+.md-health-indicator.live { color: #4ade80; background: rgba(74,222,128,.1); }
+.md-health-indicator.live .md-hdot { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+.md-health-indicator.partial { color: #facc15; background: rgba(250,204,21,.1); }
+.md-health-indicator.partial .md-hdot { background: #facc15; }
+.md-health-indicator.offline { color: #f87171; background: rgba(248,113,113,.15); }
+.md-health-indicator.offline .md-hdot { background: #f87171; animation: mdPulse 1.5s ease-in-out infinite; }
+.md-title-row { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; margin-top: 12px; }
+.md-summary-stats { display: flex; gap: 16px; flex-wrap: wrap; }
+.md-summary-stats .md-stat {
+  display: flex; align-items: center; gap: 6px;
+  font-size: .82rem; color: var(--muted);
+  background: rgba(108,124,255,.08); padding: 4px 12px; border-radius: 20px;
+}
+.md-summary-stats .md-stat b { color: var(--text); font-weight: 600; }
+
+/* Date pills */
+.md-date-nav {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.md-date-pill {
+  padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--muted); cursor: pointer;
+  font-size: .78rem; font-weight: 500; transition: all .2s;
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+}
+.md-date-pill:hover { border-color: var(--accent); color: var(--text); }
+.md-date-pill.active {
+  background: linear-gradient(135deg, var(--accent), #a78bfa);
+  color: #fff; border-color: transparent; font-weight: 600;
+  box-shadow: 0 2px 12px rgba(108,124,255,.35);
+}
+.md-date-pill .md-pill-day { font-size: .68rem; text-transform: uppercase; opacity: .7; }
+.md-date-pill .md-pill-num { font-size: .95rem; font-weight: 700; }
+.md-date-pill.today::after {
+  content: ''; display: block; width: 4px; height: 4px; border-radius: 50%;
+  background: var(--green); margin-top: 2px;
+}
+
+/* Glass cards */
+.md-card {
+  border-radius: 16px; padding: 20px; margin-bottom: 16px;
+  position: relative;
+}
+.md-glass {
+  background: rgba(26,29,39,.65);
+  backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(108,124,255,.12);
+  box-shadow: 0 4px 24px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.04);
+}
+.md-card-label {
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); font-weight: 600; margin-bottom: 12px;
+}
+
+/* Metrics row */
+.md-metrics-row {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px;
+}
+.md-metric { text-align: center; min-height: 180px; max-height: 280px; overflow: hidden; }
+.md-metric-value {
+  font-size: 2.4rem; font-weight: 800; line-height: 1;
+  background: linear-gradient(135deg, var(--accent), #a78bfa);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.md-metric-sub { font-size: .78rem; color: var(--muted); margin-top: 4px; }
+
+/* Two-column layout */
+.md-two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+
+/* Timeline SVG */
+#md-timeline-container svg { display: block; }
+.md-tl-event { cursor: pointer; transition: opacity .15s; }
+.md-tl-event:hover { opacity: .85; }
+.md-tl-tooltip {
+  position: absolute; z-index: 100; padding: 10px 14px; border-radius: 10px;
+  background: rgba(15,17,23,.95); border: 1px solid var(--border);
+  color: var(--text); font-size: .78rem; pointer-events: none;
+  max-width: 300px; box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  backdrop-filter: blur(8px);
+}
+.md-tl-tooltip b { color: var(--accent); }
+
+/* Now-marker pulse */
+@keyframes mdPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .4; }
+}
+.md-now-line { animation: mdPulse 2s ease-in-out infinite; }
+
+/* Focus gauge arc animation */
+@keyframes mdArcIn {
+  from { stroke-dashoffset: 999; }
+  to { stroke-dashoffset: 0; }
+}
+
+/* Work status items */
+.md-work-item {
+  display: flex; align-items: flex-start; gap: 10px; padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.md-work-item:last-child { border-bottom: none; }
+.md-work-icon {
+  width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center; font-size: .7rem;
+  margin-top: 2px;
+}
+.md-work-icon.done { background: rgba(74,222,128,.15); color: var(--green); }
+.md-work-icon.wip { background: rgba(250,204,21,.15); color: var(--yellow); }
+.md-work-task { font-size: .84rem; color: var(--text); line-height: 1.4; }
+.md-work-task.done-text { text-decoration: line-through; opacity: .7; }
+.md-pri-pill {
+  display: inline-block; font-size: .65rem; font-weight: 700; padding: 1px 6px;
+  border-radius: 4px; margin-left: 6px; vertical-align: middle;
+}
+.md-pri-pill.p0 { background: rgba(248,113,113,.2); color: #f87171; }
+.md-pri-pill.p1 { background: rgba(250,204,21,.2); color: #facc15; }
+.md-pri-pill.p2 { background: rgba(108,124,255,.2); color: var(--accent); }
+.md-project-tag {
+  font-size: .68rem; color: var(--muted); display: block; margin-top: 2px;
+}
+
+/* Task timeline */
+.md-tl-item {
+  display: flex; gap: 12px; padding: 12px 0;
+  border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.md-tl-item:last-child { border-bottom: none; }
+.md-tl-time {
+  flex-shrink: 0; width: 90px; font-size: .75rem; font-weight: 600;
+  color: var(--accent); padding-top: 2px; text-align: right;
+}
+.md-tl-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  background: var(--accent); margin-top: 5px;
+  box-shadow: 0 0 8px rgba(108,124,255,.4);
+}
+.md-tl-body { flex: 1; }
+.md-tl-title { font-size: .84rem; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.md-tl-apps {
+  display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 4px;
+}
+.md-tl-app {
+  font-size: .65rem; padding: 2px 8px; border-radius: 10px;
+  background: rgba(108,124,255,.1); color: var(--accent); font-weight: 500;
+}
+.md-tl-detail { font-size: .76rem; color: var(--muted); line-height: 1.5; }
+
+/* App usage bars */
+.md-app-bar-row {
+  display: flex; align-items: center; gap: 8px; padding: 3px 0 3px 18px;
+}
+.md-app-bar-name {
+  width: 130px; font-size: .75rem; color: var(--muted); text-align: right;
+  flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.md-app-bar-track {
+  flex: 1; height: 14px; background: rgba(255,255,255,.04); border-radius: 7px; overflow: hidden;
+}
+.md-app-bar-fill {
+  height: 100%; border-radius: 7px; transition: width .6s cubic-bezier(.22,1,.36,1);
+}
+.md-app-bar-val {
+  width: 40px; font-size: .72rem; color: var(--muted); flex-shrink: 0; text-align: right;
+}
+
+/* People bars */
+.md-people-bar-row {
+  display: flex; align-items: center; gap: 10px; padding: 6px 0;
+}
+.md-people-name { width: 120px; font-size: .78rem; color: var(--text); text-align: right; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.md-people-bar-wrap { flex: 1; height: 20px; background: rgba(255,255,255,.04); border-radius: 10px; overflow: hidden; }
+.md-people-bar {
+  height: 100%; border-radius: 10px; transition: width .6s cubic-bezier(.22,1,.36,1);
+  background: linear-gradient(90deg, var(--accent), #a78bfa);
+}
+.md-people-meta { font-size: .7rem; color: var(--muted); width: 80px; flex-shrink: 0; }
+
+/* Sunburst center label */
+.md-sunburst-center {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  text-align: center; pointer-events: none;
+}
+.md-sunburst-center .md-sc-val { font-size: 1.5rem; font-weight: 800; color: var(--text); }
+.md-sunburst-center .md-sc-label { font-size: .7rem; color: var(--muted); }
+
+/* No-data state */
+.md-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  min-height: 200px; color: var(--muted); font-size: .88rem; gap: 8px;
+}
+.md-empty-icon { font-size: 2rem; opacity: .3; }
+
+/* Responsive */
+@media (max-width: 900px) {
+  .md-metrics-row { grid-template-columns: repeat(2, 1fr); }
+  .md-two-col { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .md-metrics-row { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -2280,8 +4102,10 @@ body {
 <!-- ══════ TOP TABS ══════ -->
 <div class="top-tabs">
   <button class="top-tab" onclick="switchTab('setup',this)" id="tab-setup">Setup</button>
+  <button class="top-tab" onclick="switchTab('myday',this)" id="tab-myday" style="color:var(--green);font-weight:600">My Day</button>
   <button class="top-tab active" onclick="switchTab('overview',this)">Overview</button>
-  <button class="top-tab" onclick="switchTab('chat',this)" id="tab-chat" style="color:var(--accent);font-weight:600">Chat</button>
+  <button class="top-tab" onclick="switchTab('mywork',this)">My Work</button>
+  <button class="top-tab" id="tab-chat" style="color:var(--accent);font-weight:600" onclick="window.open('http://localhost:3000','_blank')">Chat &#x2197;</button>
   <button class="top-tab" onclick="switchTab('pipeline',this)">Pipeline</button>
   <button class="top-tab" onclick="switchTab('knowledge',this)">Knowledge</button>
   <button class="top-tab" onclick="switchTab('skills',this)">Skills</button>
@@ -2460,6 +4284,71 @@ body {
 
 </div><!-- /pane-setup -->
 
+<!-- ══════ MY DAY TAB ══════ -->
+<div class="tab-pane" id="pane-myday">
+
+<!-- Date navigation pills -->
+<div class="md-header">
+  <div class="md-date-nav" id="md-date-pills"></div>
+  <div class="md-title-row">
+    <h1 id="md-day-title" style="margin:0;font-size:1.6rem">My Day</h1>
+    <div id="md-health-dot" class="md-health-indicator"></div>
+    <div class="md-summary-stats" id="md-summary-stats"></div>
+  </div>
+</div>
+
+<!-- Row 1: Timeline hero -->
+<div class="md-card md-glass" id="md-timeline-card">
+  <div class="md-card-label">Timeline</div>
+  <div id="md-timeline-container" style="width:100%;overflow-x:auto"></div>
+</div>
+
+<!-- Row 2: Four metric cards -->
+<div class="md-metrics-row">
+  <div class="md-card md-glass md-metric" id="md-focus-card">
+    <div class="md-card-label">Focus Score</div>
+    <div id="md-focus-gauge"></div>
+  </div>
+  <div class="md-card md-glass md-metric" id="md-meetings-card">
+    <div class="md-card-label">Meeting Load</div>
+    <div id="md-meetings-content"></div>
+  </div>
+  <div class="md-card md-glass md-metric" id="md-switches-card">
+    <div class="md-card-label">Context Switches</div>
+    <div id="md-switches-content"></div>
+  </div>
+  <div class="md-card md-glass md-metric" id="md-completed-card">
+    <div class="md-card-label">Work Completed</div>
+    <div id="md-completed-content"></div>
+  </div>
+</div>
+
+<!-- Row 3: Sunburst + People -->
+<div class="md-two-col">
+  <div class="md-card md-glass">
+    <div class="md-card-label">App Usage</div>
+    <div id="md-sunburst-container" style="display:flex;justify-content:center;align-items:center;min-height:320px"></div>
+  </div>
+  <div class="md-card md-glass">
+    <div class="md-card-label">People</div>
+    <div id="md-people-container" style="min-height:320px"></div>
+  </div>
+</div>
+
+<!-- Row 4: Work Status + Activity Timeline -->
+<div class="md-two-col">
+  <div class="md-card md-glass">
+    <div class="md-card-label">Work Status</div>
+    <div id="md-work-status" style="max-height:500px;overflow-y:auto"></div>
+  </div>
+  <div class="md-card md-glass">
+    <div class="md-card-label">Activity Timeline</div>
+    <div id="md-task-timeline" style="max-height:500px;overflow-y:auto"></div>
+  </div>
+</div>
+
+</div><!-- /pane-myday -->
+
 <!-- ══════ TAB 1: OVERVIEW ══════ -->
 <div class="tab-pane active" id="pane-overview">
 <h1 style="margin-bottom:4px">MemoryOS Control Panel</h1>
@@ -2473,6 +4362,13 @@ body {
   <span class="label" id="priv-label">Audio: Recording</span>
   <span class="wifi-info" id="priv-wifi">WiFi: checking...</span>
   <div style="flex:1"></div>
+  <div class="audio-device-picker">
+    <select id="audio-device-select" onchange="switchAudioDevice(this.value)" disabled>
+      <option value="">Loading devices...</option>
+    </select>
+    <button class="btn-icon" onclick="loadAudioDevices()" title="Refresh device list">&#x21bb;</button>
+    <span class="audio-device-msg" id="audio-device-msg"></span>
+  </div>
   <button class="privacy-toggle-btn inactive" id="priv-btn" onclick="togglePrivacy()">Pause Audio</button>
 </div>
 
@@ -2501,6 +4397,66 @@ body {
   <div id="sync-info"></div>
 </div>
 </div><!-- /pane-overview -->
+
+<!-- ══════ MY WORK TAB ══════ -->
+<div class="tab-pane" id="pane-mywork">
+<h2 style="margin-bottom:4px">My Work</h2>
+<p style="color:var(--muted);font-size:.82rem;margin-bottom:12px">Your master task list. Edits save to tasks.md and priorities.md in the vault.</p>
+
+<div class="mw-topbar">
+  <div class="mw-toggle">
+    <button class="active" onclick="toggleMyWorkView('table',this)">Table</button>
+    <button onclick="toggleMyWorkView('raw',this)">Raw Markdown</button>
+  </div>
+  <div class="mw-filters">
+    <label style="display:flex;align-items:center;gap:4px;font-size:.78rem;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="mw-hide-done" onchange="filterTasks()" style="accent-color:var(--accent)"> Hide complete</label>
+    <select id="mw-flt-status" onchange="filterTasks()"><option value="">All Status</option><option value="not_started">Not Started</option><option value="in_progress">In Progress</option><option value="complete">Complete</option><option value="waiting">Waiting</option></select>
+    <select id="mw-flt-pri" onchange="filterTasks()"><option value="">All Priority</option><option value="P0">P0</option><option value="P1">P1</option><option value="P2">P2</option></select>
+    <select id="mw-flt-proj" onchange="filterTasks()"><option value="">All Projects</option></select>
+  </div>
+  <button class="btn btn-sm btn-green" onclick="addNewProject()">+ Add Task</button>
+</div>
+
+<!-- Table view -->
+<div id="mw-table-view">
+  <div class="card" style="padding:0;overflow:hidden">
+    <div class="task-hdr"><span>Task</span><span>Owner</span><span>Priority</span><span>Status</span><span>Due</span><span>Notes</span><span></span></div>
+    <div id="mw-task-rows"></div>
+  </div>
+  <div class="task-bottom">
+    <button class="btn" onclick="saveTaskTable()">Save All</button>
+    <span id="mw-tbl-msg" style="font-size:.82rem"></span>
+    <div class="task-counts"><span id="mw-cnt-open"></span><span id="mw-cnt-prog"></span><span id="mw-cnt-done"></span></div>
+  </div>
+</div>
+
+<!-- Raw markdown view (hidden by default) -->
+<div id="mw-raw-view" style="display:none">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px" id="mywork-grid">
+    <div class="card" style="display:flex;flex-direction:column">
+      <div class="card-header" style="flex-shrink:0">
+        <span class="card-title">Priorities</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="mw-pri-msg" style="font-size:.78rem"></span>
+          <button class="btn btn-sm" onclick="saveContextFile('priorities.md')">Save</button>
+        </div>
+      </div>
+      <textarea class="cfg-textarea" id="mw-priorities" style="flex:1;min-height:400px;font-family:'SF Mono','Menlo',monospace;font-size:.8rem;line-height:1.6;resize:vertical" spellcheck="false"></textarea>
+    </div>
+    <div class="card" style="display:flex;flex-direction:column">
+      <div class="card-header" style="flex-shrink:0">
+        <span class="card-title">Tasks</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="mw-task-msg" style="font-size:.78rem"></span>
+          <button class="btn btn-sm" onclick="saveContextFile('tasks.md')">Save</button>
+        </div>
+      </div>
+      <textarea class="cfg-textarea" id="mw-tasks" style="flex:1;min-height:400px;font-family:'SF Mono','Menlo',monospace;font-size:.8rem;line-height:1.6;resize:vertical" spellcheck="false"></textarea>
+    </div>
+  </div>
+</div>
+
+</div><!-- /pane-mywork -->
 
 <!-- ══════ TAB 2: PIPELINE ══════ -->
 <div class="tab-pane" id="pane-pipeline">
@@ -2966,11 +4922,13 @@ python3 -m src.memory.cli reindex --full             # Full reindex</pre>
     <button class="rich-view-back" onclick="closeRichView()">&larr; Back to Skills</button>
     <span class="rich-view-title" id="rich-view-title"></span>
     <span class="rich-view-date" id="rich-view-date"></span>
+    <button class="pdf-btn" onclick="downloadPDF()">Download PDF</button>
   </div>
   <div class="rich-view-body" id="rich-view-body"></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 
 <script>
 /* ═══ Globals ═══ */
@@ -3001,8 +4959,966 @@ function switchTab(name, btn) {
   if(name==='settings') { loadSettings(); loadAgentConfig(); }
   if(name==='knowledge') { loadContext(); loadKnowledgeFiles(); }
   if(name==='skills') { loadSkills(); loadAgentStatus(); }
+  if(name==='myday') { loadMyDay(mdSelectedDate||todayStr()); mdStartAutoRefresh(); }
+  else { mdStopAutoRefresh(); }
+  if(name==='mywork') loadMyWork();
   if(name==='setup') loadSetup();
   if(name==='chat' && !chatConnected) chatConnect();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MY DAY TAB
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+let mdSelectedDate = todayStr();
+let mdData = null;
+let mdChartInstances = {};
+let mdAutoRefreshTimer = null;
+let mdLastLoadTime = 0;
+
+function mdStartAutoRefresh() {
+  mdStopAutoRefresh();
+  if(mdSelectedDate === todayStr()) {
+    mdAutoRefreshTimer = setInterval(function() {
+      loadMyDay(todayStr());
+    }, 300000);
+  }
+}
+function mdStopAutoRefresh() {
+  if(mdAutoRefreshTimer) { clearInterval(mdAutoRefreshTimer); mdAutoRefreshTimer = null; }
+}
+
+const MD_COLORS = {
+  meeting: '#8b5cf6', meeting1on1: '#6c7cff', focus: '#4ade80',
+  allDay: '#475569', comm: '#38bdf8', research: '#fbbf24', admin: '#94a3b8',
+  deep: '#4ade80', other: '#6b7280',
+};
+const MD_CAT_COLORS = {
+  'Deep Work': MD_COLORS.deep, 'Meeting/Communication': MD_COLORS.meeting,
+  'Communication': MD_COLORS.comm, 'Research': MD_COLORS.research,
+  'Admin': MD_COLORS.admin, 'Other': MD_COLORS.other,
+};
+
+function mdDateStr(offset) {
+  const d = new Date(); d.setDate(d.getDate() + offset);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+function mdDayName(ds) {
+  return new Date(ds+'T12:00:00').toLocaleDateString('en-US',{weekday:'short'});
+}
+function mdDayNum(ds) { return ds.split('-')[2]; }
+function mdFormatDate(ds) {
+  return new Date(ds+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'});
+}
+function mdTimeToMin(t) {
+  if(!t) return 0;
+  const [h,m] = t.split(':').map(Number);
+  return h*60+(m||0);
+}
+
+function renderDatePills() {
+  const el = document.getElementById('md-date-pills');
+  let html = '';
+  const today = todayStr();
+  for(let i=-6; i<=0; i++) {
+    const ds = mdDateStr(i);
+    const isToday = ds === today;
+    const isActive = ds === mdSelectedDate;
+    html += `<div class="md-date-pill${isActive?' active':''}${isToday?' today':''}" onclick="mdSelectDate('${ds}')">
+      <span class="md-pill-day">${mdDayName(ds)}</span>
+      <span class="md-pill-num">${mdDayNum(ds)}</span>
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+function mdSelectDate(ds) {
+  mdSelectedDate = ds;
+  renderDatePills();
+  loadMyDay(ds);
+}
+
+async function loadMyDay(date) {
+  mdSelectedDate = date || todayStr();
+  renderDatePills();
+  document.getElementById('md-day-title').textContent = mdFormatDate(mdSelectedDate);
+
+  try {
+    const res = await fetch(`/api/myday/${mdSelectedDate}`);
+    mdData = await res.json();
+  } catch(e) {
+    mdData = {calendar:[],tasks:[],activity:{total_active_hours:0,total_context_switches:0,app_breakdown:[],hourly:{},context_switches_per_hour:{}},people:[],work_completed:[],work_in_progress:[],has_data:false};
+  }
+
+  renderMdSummaryStats(mdData);
+  renderTimeline(mdData);
+  renderFocusGauge(mdData);
+  renderMeetingCard(mdData);
+  renderSwitchCard(mdData);
+  renderCompletedCard(mdData);
+  renderAppSunburst(mdData);
+  renderPeopleChart(mdData);
+  renderWorkStatus(mdData);
+  renderTaskTimeline(mdData);
+
+  mdLastLoadTime = Date.now();
+  if(mdSelectedDate === todayStr()) {
+    updateHealthDot();
+    mdStartAutoRefresh();
+  } else {
+    document.getElementById('md-health-dot').className='md-health-indicator';
+    document.getElementById('md-health-dot').innerHTML='';
+    mdStopAutoRefresh();
+  }
+}
+
+async function updateHealthDot() {
+  const el = document.getElementById('md-health-dot');
+  try {
+    const res = await fetch('/api/status');
+    const d = await res.json();
+    const sp = d.extractors?.screenpipe?.health || 'unknown';
+    const spFrameId = d.extractors?.screenpipe?.last_frame_id || 0;
+    const wdState = d.watchdog_overall || '';
+
+    if(sp === 'healthy' && spFrameId > 0) {
+      el.className = 'md-health-indicator live';
+      el.innerHTML = '<span class="md-hdot"></span>Live';
+    } else if(sp === 'healthy') {
+      el.className = 'md-health-indicator partial';
+      el.innerHTML = '<span class="md-hdot"></span>Partial';
+    } else {
+      el.className = 'md-health-indicator offline';
+      el.innerHTML = '<span class="md-hdot"></span>Offline';
+    }
+  } catch(e) {
+    el.className = 'md-health-indicator offline';
+    el.innerHTML = '<span class="md-hdot"></span>Offline';
+  }
+}
+
+function mdHasActivity(d) {
+  return d.activity && d.activity.app_breakdown && d.activity.app_breakdown.length > 0;
+}
+
+function renderMdSummaryStats(d) {
+  const el = document.getElementById('md-summary-stats');
+  const meetings = d.calendar.filter(e=>!e.is_all_day).length;
+  const hasAct = mdHasActivity(d);
+  const hours = d.activity.total_active_hours || 0;
+  const deepMins = d.activity.app_breakdown.filter(a=>a.category==='Deep Work').reduce((s,a)=>s+a.minutes,0);
+  const totalMins = d.activity.app_breakdown.reduce((s,a)=>s+a.minutes,0);
+  const focusPct = totalMins > 0 ? Math.round(deepMins/totalMins*100) : 0;
+  const topPerson = d.people.length > 0 ? d.people[0].name : '—';
+  const completed = d.work_completed.length;
+  let html = `<span class="md-stat"><b>${meetings}</b> meetings</span>`;
+  if(hasAct) {
+    html += `<span class="md-stat"><b>${hours}h</b> active</span>`;
+    html += `<span class="md-stat"><b>${focusPct}%</b> focus</span>`;
+  } else if(meetings > 0) {
+    html += `<span class="md-stat" style="opacity:.5">Calendar only</span>`;
+  }
+  html += `<span class="md-stat"><b>${completed}</b> completed</span>`;
+  if(d.people.length > 0) html += `<span class="md-stat">Top: <b>${escHtml(topPerson)}</b></span>`;
+  el.innerHTML = html;
+}
+
+/* ─── Timeline (D3 swim-lane) ─── */
+
+function mdAssignSubLanes(events, startHour, endHour) {
+  const visible = events.filter(e => !e.is_all_day)
+    .map(ev => ({ev, s: mdTimeToMin(ev.start), e: mdTimeToMin(ev.end)}))
+    .filter(o => o.e > startHour*60 && o.s < endHour*60)
+    .sort((a,b) => a.s - b.s || a.e - b.e);
+  const lanes = [];
+  visible.forEach(item => {
+    let placed = false;
+    for(let i = 0; i < lanes.length; i++) {
+      if(item.s >= lanes[i]) { lanes[i] = item.e; item.lane = i; placed = true; break; }
+    }
+    if(!placed) { item.lane = lanes.length; lanes.push(item.e); }
+  });
+  return { items: visible, maxLanes: Math.max(lanes.length, 1) };
+}
+
+function renderTimeline(d) {
+  const container = document.getElementById('md-timeline-container');
+  container.innerHTML = '';
+
+  if(!d.has_data && d.calendar.length === 0) {
+    container.innerHTML = '<div class="md-empty"><div class="md-empty-icon">&#128197;</div>No data for this day</div>';
+    return;
+  }
+
+  const W = Math.max(container.clientWidth || 900, 700);
+  const marginL = 70, marginR = 20;
+  const startHour = 6, endHour = 21;
+  const subRowH = 26;
+  const headerH = 24;
+  const laneGap = 8;
+  const hasActivity = d.tasks && d.tasks.length > 0;
+  const hasCs = d.activity && d.activity.total_context_switches > 0;
+
+  const calResult = mdAssignSubLanes(d.calendar, startHour, endHour);
+  const meetingLaneH = Math.max(40, calResult.maxLanes * subRowH + 4);
+  const activityLaneH = hasActivity ? 40 : 0;
+  const switchLaneH = hasCs ? 36 : 0;
+
+  const totalLanes = 1 + (hasActivity?1:0) + (hasCs?1:0);
+  const H = headerH + meetingLaneH + (hasActivity ? laneGap + activityLaneH : 0) + (hasCs ? laneGap + switchLaneH : 0) + 40;
+
+  const svg = d3.select(container).append('svg')
+    .attr('width', W).attr('height', H)
+    .style('font-family','Inter,system-ui,sans-serif');
+
+  const x = d3.scaleLinear()
+    .domain([startHour*60, endHour*60])
+    .range([marginL, W - marginR]);
+
+  // Alternating hour bands + grid
+  for(let h = startHour; h <= endHour; h++) {
+    const xp = x(h*60);
+    if(h < endHour && h % 2 === 0) {
+      const xn = x((h+1)*60);
+      svg.append('rect').attr('x',xp).attr('y',headerH).attr('width',xn-xp).attr('height',H-headerH-30)
+        .attr('fill','rgba(255,255,255,.015)');
+    }
+    svg.append('line').attr('x1',xp).attr('y1',headerH).attr('x2',xp).attr('y2',H-30)
+      .attr('stroke','rgba(255,255,255,.06)').attr('stroke-width',1);
+    svg.append('text').attr('x',xp).attr('y',headerH-6)
+      .attr('text-anchor','middle').attr('fill','#6b7280').attr('font-size','11px').attr('font-weight','500')
+      .text(h < 12 ? h+'a' : h === 12 ? '12p' : (h-12)+'p');
+  }
+
+  // Tooltip div
+  let tooltip = container.querySelector('.md-tl-tooltip');
+  if(!tooltip) { tooltip = document.createElement('div'); tooltip.className='md-tl-tooltip'; tooltip.style.display='none'; container.style.position='relative'; container.appendChild(tooltip); }
+
+  // Lane 0: Meetings with sub-lane stacking
+  const lane0y = headerH;
+  svg.append('rect').attr('x',marginL).attr('y',lane0y)
+    .attr('width',W-marginL-marginR).attr('height',meetingLaneH)
+    .attr('rx',6).attr('fill','rgba(255,255,255,.02)');
+  svg.append('text').attr('x',marginL-10).attr('y',lane0y+meetingLaneH/2+4)
+    .attr('text-anchor','end').attr('fill','#6b7280').attr('font-size','10px').attr('font-weight','500').text('Meetings');
+
+  // All-day banner
+  const allDay = d.calendar.filter(e=>e.is_all_day);
+  if(allDay.length) {
+    svg.append('rect').attr('x',marginL).attr('y',lane0y).attr('width',W-marginL-marginR).attr('height',4)
+      .attr('rx',2).attr('fill',MD_COLORS.allDay).attr('opacity',.5);
+    svg.append('text').attr('x',marginL+6).attr('y',lane0y+3)
+      .attr('fill','#94a3b8').attr('font-size','7px').attr('dominant-baseline','middle')
+      .text(allDay.map(e=>e.summary).join(' · '));
+  }
+
+  calResult.items.forEach(item => {
+    const ev = item.ev;
+    const x1 = x(Math.max(item.s, startHour*60)), x2 = x(Math.min(item.e, endHour*60));
+    const w = Math.max(x2-x1, 6);
+    const rowY = lane0y + item.lane * subRowH + (allDay.length ? 5 : 2);
+    const rh = subRowH - 4;
+    const isSmall = ev.attendees && ev.attendees.length <= 2;
+    const col = isSmall ? MD_COLORS.meeting1on1 : MD_COLORS.meeting;
+    const g = svg.append('g').attr('class','md-tl-event');
+    g.append('rect').attr('x',x1).attr('y',rowY).attr('width',w).attr('height',rh)
+      .attr('rx',4).attr('fill',col).attr('opacity',.75);
+    if(w > 35) {
+      const maxChars = Math.max(Math.floor(w/6), 3);
+      g.append('text').attr('x',x1+4).attr('y',rowY+rh/2+3.5)
+        .attr('fill','#fff').attr('font-size','10px').attr('font-weight','600')
+        .text(ev.summary.length > maxChars ? ev.summary.slice(0,maxChars)+'…' : ev.summary);
+    }
+    g.on('mouseover', function(event) {
+      tooltip.style.display='block';
+      tooltip.innerHTML = `<b>${escHtml(ev.summary)}</b><br>${ev.start}–${ev.end}${ev.location?'<br>'+escHtml(ev.location):''}${ev.attendees.length?'<br>'+ev.attendees.map(escHtml).join(', '):''}`;
+    }).on('mousemove', function(event) {
+      const r = container.getBoundingClientRect();
+      tooltip.style.left = (event.clientX-r.left+12)+'px';
+      tooltip.style.top = (event.clientY-r.top-10)+'px';
+    }).on('mouseout', function() { tooltip.style.display='none'; });
+  });
+
+  // Lane 1: Activity blocks (only if data exists)
+  let lane1y = lane0y + meetingLaneH + laneGap;
+  if(hasActivity) {
+    svg.append('rect').attr('x',marginL).attr('y',lane1y)
+      .attr('width',W-marginL-marginR).attr('height',activityLaneH)
+      .attr('rx',6).attr('fill','rgba(255,255,255,.02)');
+    svg.append('text').attr('x',marginL-10).attr('y',lane1y+activityLaneH/2+4)
+      .attr('text-anchor','end').attr('fill','#6b7280').attr('font-size','10px').attr('font-weight','500').text('Activity');
+
+    d.tasks.forEach(t => {
+      const s = mdTimeToMin(t.start), e2 = mdTimeToMin(t.end);
+      if(e2 <= startHour*60 || s >= endHour*60) return;
+      const x1 = x(Math.max(s, startHour*60)), x2 = x(Math.min(e2, endHour*60));
+      const w = Math.max(x2-x1, 3);
+      const cat = t.apps && t.apps.length ? (MD_CAT_COLORS[guessCat(t.apps[0])] || MD_COLORS.other) : MD_COLORS.other;
+      const g = svg.append('g').attr('class','md-tl-event');
+      g.append('rect').attr('x',x1).attr('y',lane1y+2).attr('width',w).attr('height',activityLaneH-4)
+        .attr('rx',5).attr('fill',cat).attr('opacity',.6);
+      if(w > 40) {
+        g.append('text').attr('x',x1+4).attr('y',lane1y+activityLaneH/2+3)
+          .attr('fill','#fff').attr('font-size','9px')
+          .text(t.title.length > w/5 ? t.title.slice(0,Math.floor(w/5))+'…' : t.title);
+      }
+      g.on('mouseover', function(event) {
+        tooltip.style.display='block';
+        tooltip.innerHTML = `<b>${escHtml(t.title)}</b><br>${t.start}–${t.end}${t.apps.length?'<br>Apps: '+t.apps.map(escHtml).join(', '):''}`;
+      }).on('mousemove', function(event) {
+        const r = container.getBoundingClientRect();
+        tooltip.style.left = (event.clientX-r.left+12)+'px';
+        tooltip.style.top = (event.clientY-r.top-10)+'px';
+      }).on('mouseout', function() { tooltip.style.display='none'; });
+    });
+    lane1y += activityLaneH + laneGap;
+  }
+
+  // Lane 2: Context switches sparkline (only if data exists)
+  if(hasCs) {
+    const lane2y = lane1y;
+    svg.append('rect').attr('x',marginL).attr('y',lane2y)
+      .attr('width',W-marginL-marginR).attr('height',switchLaneH)
+      .attr('rx',6).attr('fill','rgba(255,255,255,.02)');
+    svg.append('text').attr('x',marginL-10).attr('y',lane2y+switchLaneH/2+4)
+      .attr('text-anchor','end').attr('fill','#6b7280').attr('font-size','10px').attr('font-weight','500').text('Switches');
+
+    const csData = d.activity.context_switches_per_hour || {};
+    const csEntries = [];
+    for(let h = startHour; h < endHour; h++) {
+      const key = String(h).padStart(2,'0')+':00';
+      csEntries.push({hour: h, val: csData[key]||0});
+    }
+    const csMax = Math.max(d3.max(csEntries, e=>e.val)||1, 1);
+    const csY = d3.scaleLinear().domain([0, csMax]).range([lane2y+switchLaneH-4, lane2y+4]);
+    const area = d3.area().x(e => x(e.hour*60+30)).y0(lane2y+switchLaneH-2).y1(e => csY(e.val)).curve(d3.curveBasis);
+    svg.append('path').datum(csEntries).attr('d',area)
+      .attr('fill','rgba(250,204,21,.15)').attr('stroke','rgba(250,204,21,.5)').attr('stroke-width',1.5);
+  }
+
+  // Now marker (only for today)
+  if(mdSelectedDate === todayStr()) {
+    const now = new Date();
+    const nowMin = now.getHours()*60+now.getMinutes();
+    if(nowMin >= startHour*60 && nowMin <= endHour*60) {
+      const nx = x(nowMin);
+      svg.append('line').attr('class','md-now-line')
+        .attr('x1',nx).attr('y1',headerH-2).attr('x2',nx).attr('y2',H-30)
+        .attr('stroke','#ef4444').attr('stroke-width',2).attr('stroke-dasharray','4,3');
+      svg.append('circle').attr('class','md-now-line')
+        .attr('cx',nx).attr('cy',headerH-2).attr('r',4).attr('fill','#ef4444');
+    }
+  }
+
+  // Legend
+  const legendY = H - 22;
+  const legendItems = [{label:'Meeting',color:MD_COLORS.meeting},{label:'1:1',color:MD_COLORS.meeting1on1},{label:'Deep Work',color:MD_COLORS.deep},{label:'Comms',color:MD_COLORS.comm},{label:'Research',color:MD_COLORS.research}];
+  let lx = marginL;
+  legendItems.forEach(li => {
+    svg.append('rect').attr('x',lx).attr('y',legendY).attr('width',8).attr('height',8).attr('rx',2).attr('fill',li.color).attr('opacity',.7);
+    svg.append('text').attr('x',lx+12).attr('y',legendY+7).attr('fill','#6b7280').attr('font-size','9px').text(li.label);
+    lx += li.label.length * 6 + 24;
+  });
+}
+
+function guessCat(appName) {
+  const cats = {'Microsoft Teams':'Meeting/Communication','Zoom':'Meeting/Communication','Google Meet':'Meeting/Communication','Microsoft Outlook':'Communication','Mail':'Communication','Slack':'Communication','Cursor':'Deep Work','VS Code':'Deep Work','Terminal':'Deep Work','Microsoft Word':'Deep Work','Microsoft PowerPoint':'Deep Work','Microsoft Excel':'Deep Work','Obsidian':'Deep Work','Google Chrome':'Research','Safari':'Research','Firefox':'Research','Arc':'Research','ChatGPT':'Research','Claude':'Research','Finder':'Admin','System Settings':'Admin','Calendar':'Admin'};
+  return cats[appName]||'Other';
+}
+
+/* ─── Focus Gauge (D3 arc) ─── */
+
+function renderFocusGauge(d) {
+  const el = document.getElementById('md-focus-gauge');
+  el.innerHTML = '';
+  if(!mdHasActivity(d)) {
+    el.innerHTML = '<div class="md-metric-value" style="opacity:.25">--</div><div class="md-metric-sub">no activity data</div>';
+    return;
+  }
+  const deepMins = d.activity.app_breakdown.filter(a=>a.category==='Deep Work').reduce((s,a)=>s+a.minutes,0);
+  const totalMins = d.activity.app_breakdown.reduce((s,a)=>s+a.minutes,0);
+  const pct = totalMins > 0 ? deepMins/totalMins : 0;
+  const size = 120, stroke = 12;
+
+  const svg = d3.select(el).append('svg').attr('width',size).attr('height',size)
+    .style('display','block').style('margin','0 auto');
+  const g = svg.append('g').attr('transform',`translate(${size/2},${size/2})`);
+  const r = size/2 - stroke;
+  const arc = d3.arc().innerRadius(r-stroke/2).outerRadius(r+stroke/2).startAngle(0).cornerRadius(6);
+
+  g.append('path').attr('d', arc({endAngle: Math.PI*2}))
+    .attr('fill','rgba(255,255,255,.06)');
+
+  const fg = g.append('path')
+    .attr('fill', pct > .4 ? '#4ade80' : pct > .2 ? '#facc15' : '#f87171');
+  fg.transition().duration(1000).ease(d3.easeCubicOut)
+    .attrTween('d', function() {
+      const interp = d3.interpolate(0, pct * Math.PI * 2);
+      return function(t) { return arc({endAngle: interp(t)}); };
+    });
+
+  g.append('text').attr('text-anchor','middle').attr('dy','-.1em')
+    .attr('fill','var(--text)').attr('font-size','1.5rem').attr('font-weight','800')
+    .text(Math.round(pct*100)+'%');
+  g.append('text').attr('text-anchor','middle').attr('dy','1.2em')
+    .attr('fill','var(--muted)').attr('font-size','.65rem')
+    .text('deep work');
+}
+
+/* ─── Meeting Card ─── */
+
+function renderMeetingCard(d) {
+  const el = document.getElementById('md-meetings-content');
+  const meetings = d.calendar.filter(e=>!e.is_all_day);
+  const count = meetings.length;
+  let totalMin = 0;
+  const durations = [];
+  meetings.forEach(m => {
+    const dur = mdTimeToMin(m.end) - mdTimeToMin(m.start);
+    totalMin += dur;
+    durations.push({name: m.summary.slice(0,20), dur});
+  });
+  const hours = (totalMin/60).toFixed(1);
+
+  el.innerHTML = `
+    <div class="md-metric-value">${count}</div>
+    <div class="md-metric-sub">${hours}h in meetings</div>
+    <div style="height:60px;position:relative"><canvas id="md-meeting-bars"></canvas></div>
+  `;
+
+  if(durations.length) {
+    const ctx = document.getElementById('md-meeting-bars');
+    if(mdChartInstances.meetingBars) mdChartInstances.meetingBars.destroy();
+    mdChartInstances.meetingBars = new Chart(ctx, {
+      type:'bar',
+      data:{
+        labels: durations.map(d=>d.name),
+        datasets:[{data:durations.map(d=>d.dur), backgroundColor:'rgba(139,92,246,.5)', borderRadius:4}]
+      },
+      options:{
+        responsive:true, maintainAspectRatio:false,
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{display:false},
+          y:{display:false}
+        }
+      }
+    });
+  }
+}
+
+/* ─── Context Switches Card ─── */
+
+function renderSwitchCard(d) {
+  const el = document.getElementById('md-switches-content');
+  if(!mdHasActivity(d)) {
+    el.innerHTML = '<div class="md-metric-value" style="opacity:.25">--</div><div class="md-metric-sub">no activity data</div>';
+    return;
+  }
+  const total = d.activity.total_context_switches || 0;
+  const csData = d.activity.context_switches_per_hour || {};
+  const color = total < 30 ? 'var(--green)' : total < 60 ? 'var(--yellow)' : '#f87171';
+
+  el.innerHTML = `
+    <div class="md-metric-value" style="background:none;-webkit-text-fill-color:${color};color:${color}">${total}</div>
+    <div class="md-metric-sub">total switches</div>
+    <div style="height:50px;position:relative"><canvas id="md-switch-spark"></canvas></div>
+  `;
+
+  const labels = [], vals = [];
+  for(let h=6; h<21; h++) {
+    labels.push(h+'');
+    const key = String(h).padStart(2,'0')+':00';
+    vals.push(csData[key]||0);
+  }
+  const ctx = document.getElementById('md-switch-spark');
+  if(mdChartInstances.switchSpark) mdChartInstances.switchSpark.destroy();
+  mdChartInstances.switchSpark = new Chart(ctx, {
+    type:'line',
+    data:{
+      labels,
+      datasets:[{
+        data:vals, fill:true,
+        borderColor:'rgba(250,204,21,.6)', backgroundColor:'rgba(250,204,21,.08)',
+        borderWidth:2, pointRadius:0, tension:.4,
+      }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{display:false},y:{display:false}}
+    }
+  });
+}
+
+/* ─── Work Completed Card ─── */
+
+function renderCompletedCard(d) {
+  const el = document.getElementById('md-completed-content');
+  const count = d.work_completed.length;
+  if(count === 0) {
+    el.innerHTML = `<div class="md-metric-value" style="opacity:.3">0</div><div class="md-metric-sub">No completions</div>`;
+    return;
+  }
+  let html = `<div class="md-metric-value">${count}</div><div class="md-metric-sub">tasks shipped</div><div style="margin-top:8px;text-align:left">`;
+  d.work_completed.slice(0,4).forEach(w => {
+    html += `<div style="font-size:.72rem;color:var(--green);padding:2px 0">&#10003; ${escHtml(w.task.slice(0,40))}${w.task.length>40?'…':''}</div>`;
+  });
+  if(count > 4) html += `<div style="font-size:.68rem;color:var(--muted)">+${count-4} more</div>`;
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+/* ─── App Sunburst (D3) ─── */
+
+function renderAppSunburst(d) {
+  const container = document.getElementById('md-sunburst-container');
+  container.innerHTML = '';
+  const apps = d.activity.app_breakdown || [];
+  if(!apps.length) {
+    container.innerHTML = '<div class="md-empty"><div class="md-empty-icon">&#128187;</div>No app data</div>';
+    return;
+  }
+
+  const totalMins = apps.reduce((s,a)=>s+a.minutes,0);
+  const catGroups = {};
+  apps.forEach(a => {
+    if(!catGroups[a.category]) catGroups[a.category] = {cat:a.category, apps:[], total:0};
+    catGroups[a.category].apps.push(a);
+    catGroups[a.category].total += a.minutes;
+  });
+  const sorted = Object.values(catGroups).sort((a,b)=>b.total-a.total);
+
+  let html = '<div style="margin-bottom:12px;display:flex;align-items:baseline;gap:10px">';
+  html += `<span style="font-size:1.8rem;font-weight:800;background:linear-gradient(135deg,var(--accent),#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent">${totalMins}m</span>`;
+  html += '<span style="font-size:.78rem;color:var(--muted)">total tracked</span></div>';
+
+  sorted.forEach(group => {
+    const col = MD_CAT_COLORS[group.cat] || MD_COLORS.other;
+    const pct = Math.round(group.total/totalMins*100);
+    html += `<div style="margin-bottom:14px">`;
+    html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">`;
+    html += `<span style="width:10px;height:10px;border-radius:3px;background:${col};flex-shrink:0"></span>`;
+    html += `<span style="font-size:.8rem;font-weight:600;color:var(--text)">${escHtml(group.cat)}</span>`;
+    html += `<span style="font-size:.72rem;color:var(--muted);margin-left:auto">${group.total}m · ${pct}%</span>`;
+    html += `</div>`;
+    group.apps.sort((a,b)=>b.minutes-a.minutes).forEach(app => {
+      const barPct = Math.max(app.minutes/sorted[0].apps[0].minutes*100, 3);
+      html += `<div class="md-app-bar-row">`;
+      html += `<span class="md-app-bar-name">${escHtml(app.name)}</span>`;
+      html += `<div class="md-app-bar-track"><div class="md-app-bar-fill" style="width:${barPct}%;background:${col}"></div></div>`;
+      html += `<span class="md-app-bar-val">${app.minutes}m</span>`;
+      html += `</div>`;
+    });
+    html += `</div>`;
+  });
+
+  container.innerHTML = html;
+  container.style.display = 'block';
+}
+
+/* ─── People Chart ─── */
+
+function renderPeopleChart(d) {
+  const container = document.getElementById('md-people-container');
+  container.innerHTML = '';
+  const people = (d.people||[]).slice(0,10);
+  if(!people.length) {
+    container.innerHTML = '<div class="md-empty"><div class="md-empty-icon">&#128101;</div>No interactions</div>';
+    return;
+  }
+  const maxMin = Math.max(...people.map(p=>p.total_minutes),1);
+  let html = '';
+  people.forEach(p => {
+    const pct = Math.max(p.total_minutes/maxMin*100, 4);
+    html += `<div class="md-people-bar-row">
+      <div class="md-people-name" title="${escHtml(p.name)}">${escHtml(p.name)}</div>
+      <div class="md-people-bar-wrap"><div class="md-people-bar" style="width:${pct}%"></div></div>
+      <div class="md-people-meta">${p.meetings} mtg · ${Math.round(p.total_minutes)}m</div>
+    </div>`;
+  });
+  container.innerHTML = html;
+}
+
+/* ─── Work Status ─── */
+
+function renderWorkStatus(d) {
+  const el = document.getElementById('md-work-status');
+  const completed = d.work_completed || [];
+  const wip = d.work_in_progress || [];
+  if(!completed.length && !wip.length) {
+    el.innerHTML = '<div class="md-empty"><div class="md-empty-icon">&#128203;</div>No work items</div>';
+    return;
+  }
+  let html = '';
+  completed.forEach(w => {
+    const priClass = (w.priority||'P1').toLowerCase();
+    html += `<div class="md-work-item">
+      <div class="md-work-icon done">&#10003;</div>
+      <div>
+        <div class="md-work-task done-text">${escHtml(w.task)}<span class="md-pri-pill ${priClass}">${w.priority||'P1'}</span></div>
+        <div class="md-project-tag">${escHtml(w.project||'')}</div>
+      </div>
+    </div>`;
+  });
+  wip.forEach(w => {
+    const priClass = (w.priority||'P1').toLowerCase();
+    html += `<div class="md-work-item">
+      <div class="md-work-icon wip">&#9654;</div>
+      <div>
+        <div class="md-work-task">${escHtml(w.task)}<span class="md-pri-pill ${priClass}">${w.priority||'P1'}</span></div>
+        <div class="md-project-tag">${escHtml(w.project||'')}${w.notes?' · '+escHtml(w.notes):''}</div>
+      </div>
+    </div>`;
+  });
+  el.innerHTML = html;
+}
+
+/* ─── Task Timeline (recall blocks) ─── */
+
+function renderTaskTimeline(d) {
+  const el = document.getElementById('md-task-timeline');
+  const tasks = d.tasks || [];
+  if(!tasks.length) {
+    el.innerHTML = '<div class="md-empty"><div class="md-empty-icon">&#128336;</div>No activity data</div>';
+    return;
+  }
+  let html = '';
+  tasks.forEach(t => {
+    html += `<div class="md-tl-item">
+      <div class="md-tl-time">${t.start}–${t.end}</div>
+      <div class="md-tl-dot"></div>
+      <div class="md-tl-body">
+        <div class="md-tl-title">${escHtml(t.title)}</div>
+        ${t.apps.length ? '<div class="md-tl-apps">'+t.apps.map(a=>'<span class="md-tl-app">'+escHtml(a)+'</span>').join('')+'</div>' : ''}
+        ${t.details.length ? '<div class="md-tl-detail">'+t.details.slice(0,3).map(escHtml).join('<br>')+'</div>' : ''}
+      </div>
+    </div>`;
+  });
+  el.innerHTML = html;
+}
+
+/* ═══ My Work (table + raw editors) ═══ */
+let _mwData = null;
+let _mwView = 'table';
+let _mwRawLoaded = false;
+
+async function loadMyWork() {
+  if (_mwView === 'table') {
+    await loadTaskTable();
+  } else {
+    await loadRawEditors();
+  }
+}
+
+function toggleMyWorkView(mode, btn) {
+  _mwView = mode;
+  document.querySelectorAll('.mw-toggle button').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  document.getElementById('mw-table-view').style.display = mode==='table' ? '' : 'none';
+  document.getElementById('mw-raw-view').style.display = mode==='raw' ? '' : 'none';
+  if(mode==='table') { _mwData=null; loadTaskTable(); }
+  else { _mwRawLoaded=false; loadRawEditors(); }
+}
+
+async function loadTaskTable() {
+  const el = document.getElementById('mw-task-rows');
+  el.innerHTML='<div style="padding:16px;color:var(--muted)">Loading...</div>';
+  try {
+    _mwData = await(await fetch('/api/tasks')).json();
+    renderTaskTable();
+    populateProjectFilter();
+    updateTaskCounts();
+  } catch(e) { el.innerHTML='<div style="padding:16px;color:var(--red)">Failed to load tasks</div>'; }
+}
+
+function renderTaskTable() {
+  if(!_mwData) return;
+  const el = document.getElementById('mw-task-rows');
+  const fSt = document.getElementById('mw-flt-status').value;
+  const fPr = document.getElementById('mw-flt-pri').value;
+  const fPj = document.getElementById('mw-flt-proj').value;
+  const hideDone = document.getElementById('mw-hide-done').checked;
+  let h='';
+  const statusOpts = '<option value="not_started">Not Started</option><option value="in_progress">In Progress</option><option value="complete">Complete</option><option value="waiting">Waiting</option><option value="blocked">Blocked</option>';
+  const priOpts = '<option value="P0">P0</option><option value="P1">P1</option><option value="P2">P2</option>';
+  const allProjects = (_mwData.project_names||[]);
+
+  for(let pi=0;pi<_mwData.projects.length;pi++){
+    const proj=_mwData.projects[pi];
+    if(fPj && proj.name!==fPj) continue;
+    const tasks = proj.tasks||[];
+    const filtered = tasks.filter(t=>{
+      if(hideDone && t.status==='complete') return false;
+      if(fSt && t.status!==fSt) return false;
+      if(fPr && t.priority!==fPr) return false;
+      return true;
+    });
+    if(fSt || fPr || hideDone) { if(!filtered.length) continue; }
+    let cnt = tasks.length;
+    let done = tasks.filter(t=>t.status==='complete').length;
+    for(const t of tasks){ const subs=t.subtasks||[]; cnt+=subs.length; done+=subs.filter(s=>s.status==='complete').length; }
+    h+=`<div class="task-proj-hdr" onclick="toggleProject(${pi})">
+      <span class="proj-toggle" id="proj-tog-${pi}">&#9660;</span>
+      <span class="proj-name" id="proj-name-${pi}">${escHtml(proj.name)}</span>
+      <button class="proj-edit-btn" onclick="event.stopPropagation();editProjectName(${pi})" title="Rename project">&#9998;</button>
+      <span class="proj-meta"><span class="proj-owner-lbl" onclick="event.stopPropagation();editProjectOwner(${pi})" title="Click to edit owner">${proj.owner?escHtml(proj.owner):'(no owner)'}</span> &middot; ${done}/${cnt} done</span>
+      <button class="btn btn-sm" style="margin-left:8px;font-size:.72rem" onclick="event.stopPropagation();addTask('${escHtml(proj.name)}')">+ Task</button>
+    </div>`;
+    h+=`<div id="proj-body-${pi}">`;
+    const renderList = (fSt||fPr) ? filtered : tasks;
+    for(let ti=0;ti<renderList.length;ti++){
+      const t=renderList[ti];
+      h+=taskRowHtml(pi,ti,t,allProjects,statusOpts,priOpts);
+      const subs=t.subtasks||[];
+      for(let si=0;si<subs.length;si++){
+        if(hideDone && subs[si].status==='complete') continue;
+        h+=subTaskRowHtml(pi,ti,si,subs[si],statusOpts,priOpts);
+      }
+    }
+    h+=`</div>`;
+  }
+  if(_mwData.waiting && _mwData.waiting.length){
+    h+=`<div class="task-proj-hdr"><span class="proj-name">Waiting On Others</span><span class="proj-meta">${_mwData.waiting.length} items</span></div>`;
+    for(const w of _mwData.waiting){
+      h+=`<div class="task-row" style="color:var(--orange)"><span>${escHtml(w.what)}</span><span>${escHtml(w.who)}</span><span></span><span>Waiting</span><span>${escHtml(w.since)}</span><span>${escHtml(w.followup)}</span><span></span></div>`;
+    }
+  }
+  el.innerHTML=h||'<div style="padding:16px;color:var(--muted)">No tasks found. Click + Add Task to get started.</div>';
+}
+
+function taskRowHtml(pi,ti,t,allProjects,statusOpts,priOpts){
+  const stCls='st-'+t.status;
+  const prCls='pri-'+t.priority.toLowerCase();
+  const isOverdue = t.due && t.status!=='complete' && isDatePast(t.due);
+  return `<div class="task-row">
+    <span data-label="Task"><input class="cfg-input" value="${escAttr(t.task)}" onchange="updTask(${pi},${ti},'task',this.value)"></span>
+    <span data-label="Owner"><input class="cfg-input" value="${escAttr(t.owner||'')}" onchange="updTask(${pi},${ti},'owner',this.value)" style="font-size:.74rem"></span>
+    <span data-label="Priority"><select class="cfg-input ${prCls}" onchange="updTask(${pi},${ti},'priority',this.value);this.className='cfg-input pri-'+this.value.toLowerCase()">${priOpts.replace('value="'+t.priority+'"','value="'+t.priority+'" selected')}</select></span>
+    <span data-label="Status"><select class="cfg-input ${stCls}" onchange="updTask(${pi},${ti},'status',this.value);this.className='cfg-input st-'+this.value">${statusOpts.replace('value="'+t.status+'"','value="'+t.status+'" selected')}</select></span>
+    <span data-label="Due"><input class="cfg-input${isOverdue?' overdue':''}" value="${escAttr(t.due)}" placeholder="e.g. Mar 1" onchange="updTask(${pi},${ti},'due',this.value)" style="font-size:.74rem"></span>
+    <span data-label="Notes"><input class="cfg-input" value="${escAttr(t.notes)}" placeholder="// progress notes" onchange="updTask(${pi},${ti},'notes',this.value)" style="font-size:.74rem;color:var(--muted)"></span>
+    <span class="task-actions"><button class="task-add-sub" onclick="addSubTask(${pi},${ti})" title="Add sub-task">+sub</button><button class="task-del" onclick="deleteTask(${pi},${ti})" title="Delete">&times;</button></span>
+  </div>`;
+}
+
+function subTaskRowHtml(pi,ti,si,t,statusOpts,priOpts){
+  const stCls='st-'+t.status;
+  const prCls='pri-'+t.priority.toLowerCase();
+  const isOverdue = t.due && t.status!=='complete' && isDatePast(t.due);
+  return `<div class="task-row subtask">
+    <span data-label="Task"><input class="cfg-input" value="${escAttr(t.task)}" onchange="updSubTask(${pi},${ti},${si},'task',this.value)"></span>
+    <span data-label="Owner"><input class="cfg-input" value="${escAttr(t.owner||'')}" onchange="updSubTask(${pi},${ti},${si},'owner',this.value)" style="font-size:.74rem"></span>
+    <span data-label="Priority"><select class="cfg-input ${prCls}" onchange="updSubTask(${pi},${ti},${si},'priority',this.value);this.className='cfg-input pri-'+this.value.toLowerCase()">${priOpts.replace('value="'+t.priority+'"','value="'+t.priority+'" selected')}</select></span>
+    <span data-label="Status"><select class="cfg-input ${stCls}" onchange="updSubTask(${pi},${ti},${si},'status',this.value);this.className='cfg-input st-'+this.value">${statusOpts.replace('value="'+t.status+'"','value="'+t.status+'" selected')}</select></span>
+    <span data-label="Due"><input class="cfg-input${isOverdue?' overdue':''}" value="${escAttr(t.due)}" placeholder="e.g. Mar 1" onchange="updSubTask(${pi},${ti},${si},'due',this.value)" style="font-size:.74rem"></span>
+    <span data-label="Notes"><input class="cfg-input" value="${escAttr(t.notes)}" placeholder="// progress notes" onchange="updSubTask(${pi},${ti},${si},'notes',this.value)" style="font-size:.74rem;color:var(--muted)"></span>
+    <span class="task-actions"><button class="task-del" onclick="deleteSubTask(${pi},${ti},${si})" title="Delete">&times;</button></span>
+  </div>`;
+}
+
+function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+
+function isDatePast(d){
+  if(!d) return false;
+  try {
+    const now=new Date(); now.setHours(0,0,0,0);
+    const parts=d.match(/([A-Za-z]+)\s+(\d+)/);
+    if(!parts) return false;
+    const months={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+    const m=months[parts[1].toLowerCase().slice(0,3)];
+    if(m===undefined) return false;
+    const dt=new Date(now.getFullYear(),m,parseInt(parts[2]));
+    return dt<now;
+  } catch(e){return false;}
+}
+
+function updTask(pi,ti,field,val){
+  if(!_mwData) return;
+  const t=_mwData.projects[pi].tasks[ti];
+  if(!t) return;
+  t[field]=val;
+  if(field==='status' && val==='complete' && !t.due){
+    const now=new Date();
+    const mon=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    t.due=mon[now.getMonth()]+' '+now.getDate();
+  }
+  updateTaskCounts();
+}
+
+function addNewProject(){
+  if(!_mwData) return;
+  const name=prompt('New project/category name:');
+  if(!name||!name.trim()) return;
+  _mwData.projects.push({name:name.trim(),owner:'',goal:'',priority_status:'',tasks:[]});
+  renderTaskTable();
+  populateProjectFilter();
+  updateTaskCounts();
+}
+
+function editProjectName(pi){
+  if(!_mwData||!_mwData.projects[pi]) return;
+  const cur=_mwData.projects[pi].name;
+  const val=prompt('Rename project:',cur);
+  if(val===null||!val.trim()||val.trim()===cur) return;
+  _mwData.projects[pi].name=val.trim();
+  renderTaskTable();
+  populateProjectFilter();
+}
+
+function editProjectOwner(pi){
+  if(!_mwData||!_mwData.projects[pi]) return;
+  const cur=_mwData.projects[pi].owner||'';
+  const val=prompt('Project owner:',cur);
+  if(val===null) return;
+  _mwData.projects[pi].owner=val.trim();
+  renderTaskTable();
+}
+
+function addTask(projName){
+  if(!_mwData) return;
+  let pi=-1;
+  if(projName){
+    pi=_mwData.projects.findIndex(p=>p.name===projName);
+  }
+  if(pi<0){
+    if(_mwData.projects.length) pi=0;
+    else { _mwData.projects.push({name:'General',owner:'',goal:'',priority_status:'',tasks:[]}); pi=0; }
+  }
+  const newId='t'+(Date.now()%100000);
+  _mwData.projects[pi].tasks.push({id:newId,task:'',status:'not_started',priority:'P1',due:'',owner:_mwData.projects[pi].owner||'',notes:'',section:'active',subtasks:[]});
+  renderTaskTable();
+  updateTaskCounts();
+  const rows=document.querySelectorAll('#proj-body-'+pi+' .task-row:not(.subtask)');
+  if(rows.length){const last=rows[rows.length-1];const inp=last.querySelector('input');if(inp)inp.focus();}
+}
+
+function addSubTask(pi,ti){
+  if(!_mwData) return;
+  const parent=_mwData.projects[pi].tasks[ti];
+  if(!parent) return;
+  if(!parent.subtasks) parent.subtasks=[];
+  const newId='t'+(Date.now()%100000);
+  parent.subtasks.push({id:newId,task:'',status:'not_started',priority:parent.priority||'P1',due:'',owner:parent.owner||'',notes:'',section:'active'});
+  renderTaskTable();
+  updateTaskCounts();
+  const body=document.getElementById('proj-body-'+pi);
+  if(body){const subs=body.querySelectorAll('.task-row.subtask');if(subs.length){const last=subs[subs.length-1];const inp=last.querySelector('input');if(inp)inp.focus();}}
+}
+
+function updSubTask(pi,ti,si,field,val){
+  if(!_mwData) return;
+  const parent=_mwData.projects[pi].tasks[ti];
+  if(!parent||!parent.subtasks) return;
+  const t=parent.subtasks[si];
+  if(!t) return;
+  t[field]=val;
+  if(field==='status' && val==='complete' && !t.due){
+    const now=new Date();
+    const mon=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    t.due=mon[now.getMonth()]+' '+now.getDate();
+  }
+  updateTaskCounts();
+}
+
+function deleteSubTask(pi,ti,si){
+  if(!_mwData) return;
+  const parent=_mwData.projects[pi].tasks[ti];
+  if(!parent||!parent.subtasks) return;
+  const t=parent.subtasks[si];
+  if(t && t.task && !confirm('Delete sub-task "'+t.task+'"?')) return;
+  parent.subtasks.splice(si,1);
+  renderTaskTable();
+  updateTaskCounts();
+}
+
+function deleteTask(pi,ti){
+  if(!_mwData) return;
+  const t=_mwData.projects[pi].tasks[ti];
+  if(t && t.task && !confirm('Delete "'+t.task+'"?')) return;
+  _mwData.projects[pi].tasks.splice(ti,1);
+  renderTaskTable();
+  updateTaskCounts();
+}
+
+function toggleProject(pi){
+  const body=document.getElementById('proj-body-'+pi);
+  const tog=document.getElementById('proj-tog-'+pi);
+  if(!body) return;
+  if(body.style.display==='none'){body.style.display='';if(tog)tog.classList.remove('collapsed');}
+  else{body.style.display='none';if(tog)tog.classList.add('collapsed');}
+}
+
+function populateProjectFilter(){
+  const sel=document.getElementById('mw-flt-proj');
+  if(!sel||!_mwData) return;
+  sel.innerHTML='<option value="">All Projects</option>';
+  for(const p of _mwData.projects){
+    sel.innerHTML+=`<option value="${escAttr(p.name)}">${escHtml(p.name)}</option>`;
+  }
+}
+
+function filterTasks(){ renderTaskTable(); }
+
+function updateTaskCounts(){
+  if(!_mwData) return;
+  let open=0,prog=0,done=0;
+  function countTask(t){
+    if(t.status==='not_started') open++;
+    else if(t.status==='in_progress') prog++;
+    else if(t.status==='complete') done++;
+  }
+  for(const p of _mwData.projects) for(const t of p.tasks||[]){
+    countTask(t);
+    for(const s of t.subtasks||[]) countTask(s);
+  }
+  const ce=document.getElementById('mw-cnt-open');
+  const pe=document.getElementById('mw-cnt-prog');
+  const de=document.getElementById('mw-cnt-done');
+  if(ce) ce.textContent=open+' open';
+  if(pe) pe.textContent=prog+' in progress';
+  if(de) de.textContent=done+' complete';
+}
+
+async function saveTaskTable(){
+  if(!_mwData) return;
+  const msg=document.getElementById('mw-tbl-msg');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--muted)';}
+  try{
+    const r=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_mwData)});
+    if(r.ok){if(msg){msg.textContent='Saved!';msg.style.color='var(--green)';} _mwRawLoaded=false;}
+    else{const d=await r.json();if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}}
+  }catch(e){if(msg){msg.textContent='Error';msg.style.color='var(--red)';}}
+  setTimeout(()=>{if(msg) msg.textContent='';},3000);
+}
+
+async function loadRawEditors(){
+  if(_mwRawLoaded) return;
+  try{
+    const [pri,tsk]=await Promise.all([
+      fetch('/api/context/file?name=priorities.md').then(r=>r.json()),
+      fetch('/api/context/file?name=tasks.md').then(r=>r.json()),
+    ]);
+    document.getElementById('mw-priorities').value=pri.content||'';
+    document.getElementById('mw-tasks').value=tsk.content||'';
+    _mwRawLoaded=true;
+  }catch(e){
+    document.getElementById('mw-priorities').value='# Failed to load';
+    document.getElementById('mw-tasks').value='# Failed to load';
+  }
+}
+
+async function saveContextFile(name){
+  const isP=name==='priorities.md';
+  const ta=document.getElementById(isP?'mw-priorities':'mw-tasks');
+  const msg=document.getElementById(isP?'mw-pri-msg':'mw-task-msg');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--muted)';}
+  try{
+    const r=await fetch('/api/context/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,content:ta.value})});
+    if(r.ok){if(msg){msg.textContent='Saved!';msg.style.color='var(--green)';} _mwData=null;}
+    else{if(msg){msg.textContent='Failed';msg.style.color='var(--red)';}}
+  }catch(e){if(msg){msg.textContent='Error';msg.style.color='var(--red)';}}
+  setTimeout(()=>{if(msg) msg.textContent='';},3000);
 }
 
 /* ═══ Setup Wizard ═══ */
@@ -3537,11 +6453,11 @@ function showSkillReport(name,date) {
 }
 function openRichView(name,date,data) {
   const overlay=document.getElementById('rich-view-overlay');
-  const titleMap={'news-pulse':'News Pulse','weekly-status':'Weekly Status','plan-my-week':'Plan My Week','morning-brief':'Morning Brief','commitment-tracker':'Commitment Tracker','project-brief':'Project Brief','focus-audit':'Focus Audit','relationship-crm':'Relationship CRM','team-manager':'Team Manager'};
+  const titleMap={'news-pulse':'News Pulse','weekly-status':'Weekly Status','plan-my-week':'Plan My Week','morning-brief':'Morning Brief','commitment-tracker':'Commitment Tracker','project-brief':'Project Brief','focus-audit':'Focus Audit','relationship-crm':'Relationship CRM','team-manager':'Team Manager','approvals-queue':'Approvals Queue'};
   document.getElementById('rich-view-title').textContent=titleMap[name]||name;
   document.getElementById('rich-view-date').textContent=date;
   const body=document.getElementById('rich-view-body');
-  const renderers={'news-pulse':renderNewsPulse,'weekly-status':renderWeeklyStatus,'plan-my-week':renderPlanMyWeek,'morning-brief':renderMorningBrief,'commitment-tracker':renderCommitmentTracker,'project-brief':renderProjectBrief,'focus-audit':renderFocusAudit,'relationship-crm':renderRelationshipCrm,'team-manager':renderTeamManager};
+  const renderers={'news-pulse':renderNewsPulse,'weekly-status':renderWeeklyStatus,'plan-my-week':renderPlanMyWeek,'morning-brief':renderMorningBrief,'commitment-tracker':renderCommitmentTracker,'project-brief':renderProjectBrief,'focus-audit':renderFocusAudit,'relationship-crm':renderRelationshipCrm,'team-manager':renderTeamManager,'approvals-queue':renderApprovalsQueue};
   const fn=renderers[name];
   if(fn) body.innerHTML=fn(data,name,date);
   else body.innerHTML='<p>Rich view not available for this skill.</p>';
@@ -3551,6 +6467,7 @@ function openRichView(name,date,data) {
   setTimeout(()=>_initRichViewCharts(name,data),100);
 }
 function _initRichViewCharts(name,data) {
+  if(name==='weekly-status') initWeeklyStatusCharts(data);
   if(name==='commitment-tracker') {
     createGaugeChart('ct-health-gauge',data.health_score||0,'Health');
     const bp=data.by_priority||{};
@@ -3562,7 +6479,18 @@ function _initRichViewCharts(name,data) {
   if(name==='plan-my-week') {
     createGaugeChart('pmw-score-gauge',data.week_score||0,'Week');
     const days=data.days||[];
-    if(days.length) createBarChart('pmw-capacity-chart',days.map(d=>d.day_name||d.date),[{label:'Meeting',data:days.map(d=>d.meeting_hours||d.meetings?.hours||0),backgroundColor:'rgba(248,113,113,.6)',borderRadius:6},{label:'Focus',data:days.map(d=>d.focus_hours||0),backgroundColor:'rgba(74,222,128,.5)',borderRadius:6}]);
+    if(days.length) {
+      const hasActuals=days.some(d=>d.actual_meeting_hours!=null);
+      const datasets=[
+        {label:'Planned Meetings',data:days.map(d=>d.meeting_hours||d.meetings?.hours||0),backgroundColor:'rgba(248,113,113,.35)',borderRadius:6,borderWidth:1,borderColor:'rgba(248,113,113,.6)'},
+        {label:'Planned Focus',data:days.map(d=>d.focus_hours||0),backgroundColor:'rgba(74,222,128,.3)',borderRadius:6,borderWidth:1,borderColor:'rgba(74,222,128,.5)'}
+      ];
+      if(hasActuals) {
+        datasets.push({label:'Actual Meetings',data:days.map(d=>d.actual_meeting_hours!=null?d.actual_meeting_hours:null),backgroundColor:'rgba(248,113,113,.8)',borderRadius:6});
+        datasets.push({label:'Actual Focus',data:days.map(d=>d.actual_focus_hours!=null?d.actual_focus_hours:null),backgroundColor:'rgba(74,222,128,.8)',borderRadius:6});
+      }
+      createBarChart('pmw-capacity-chart',days.map(d=>d.day_name||d.date),datasets);
+    }
   }
   if(name==='morning-brief') {
     createGaugeChart('mb-day-gauge',data.day_score||0,'Day');
@@ -3571,20 +6499,173 @@ function _initRichViewCharts(name,data) {
   }
   if(name==='focus-audit') {
     createGaugeChart('fa-prod-gauge',data.productivity_score||0,'Score');
-    const ab=data.app_breakdown||data.top_apps||[];
-    if(ab.length) createDoughnutChart('fa-app-chart',ab.map(a=>a.name),ab.map(a=>a.minutes||a.hours*60||0),ab.map((_,i)=>_avatarColors[i%_avatarColors.length]));
+    const abRaw=data.app_breakdown||[];
+    const abValid=abRaw.filter(a=>(a.minutes||0)>0);
+    const taRaw=data.top_apps||[];
+    const taValid=taRaw.filter(a=>(a.hours||0)>0);
+    const chartData=abValid.length?abValid.map(a=>({name:a.name,val:a.minutes||0})):taValid.map(a=>({name:a.name,val:Math.round((a.hours||0)*60)}));
+    if(chartData.length) createDoughnutChart('fa-app-chart',chartData.map(a=>a.name),chartData.map(a=>a.val),chartData.map((_,i)=>_avatarColors[i%_avatarColors.length]));
   }
   if(name==='relationship-crm') {
-    const top=(data.top_contacts||[]).slice(0,8);
-    if(top.length) createBarChart('crm-freq-chart',top.map(c=>c.name.split(' ')[0]),[{label:'7d',data:top.map(c=>c.interactions_7d||0),backgroundColor:'rgba(108,124,255,.7)',borderRadius:6},{label:'30d',data:top.map(c=>c.interactions_30d||0),backgroundColor:'rgba(74,222,128,.5)',borderRadius:6}]);
+    const top=(data.top_contacts||[]).filter(c=>(c.interactions_30d||0)>0||(c.email_count_30d||0)>0||(c.meeting_count_30d||0)>0||(c.teams_count_30d||0)>0).slice(0,10);
+    if(top.length) {
+      const hasChannel=top.some(c=>(c.email_count_30d||0)>0||(c.meeting_count_30d||0)>0||(c.teams_count_30d||0)>0);
+      const datasets=hasChannel?[
+        {label:'Email',data:top.map(c=>c.email_count_30d||0),backgroundColor:'rgba(108,124,255,.7)',borderRadius:6},
+        {label:'Meeting',data:top.map(c=>c.meeting_count_30d||0),backgroundColor:'rgba(74,222,128,.6)',borderRadius:6},
+        {label:'Teams',data:top.map(c=>c.teams_count_30d||0),backgroundColor:'rgba(168,85,247,.7)',borderRadius:6}
+      ]:[{label:'30d Interactions',data:top.map(c=>c.interactions_30d||0),backgroundColor:'rgba(108,124,255,.7)',borderRadius:6}];
+      const el=document.getElementById('crm-freq-chart');
+      if(el&&typeof Chart!=='undefined') new Chart(el,{type:'bar',data:{labels:top.map(c=>c.name.split(' ')[0]),datasets:datasets},options:{responsive:true,plugins:{legend:{labels:{color:'#9ca3af'}}},scales:{x:{stacked:hasChannel,ticks:{color:'#9ca3af'},grid:{color:'rgba(255,255,255,.05)'}},y:{stacked:hasChannel,ticks:{color:'#9ca3af'},grid:{color:'rgba(255,255,255,.05)'}}}}});
+    }
   }
   if(name==='team-manager') {
     createGaugeChart('tm-health-gauge',data.team_health_score||0,'Health');
   }
 }
+
+/* ═══ Approvals Queue Rich View ═══ */
+function renderApprovalsQueue(data) {
+  const pc=data.pending_count||0, atc=data.approved_today_count||0, oc=data.overdue_count||0;
+  const pcColor=pc>0?'var(--yellow)':'var(--green)';
+  const ocColor=oc>0?'var(--red)':'var(--green)';
+  let h=`<div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:24px">
+    <div class="card" style="text-align:center"><div style="font-size:2rem;font-weight:700;color:${pcColor}">${pc}</div><div style="color:var(--muted);font-size:.84rem">Pending</div></div>
+    <div class="card" style="text-align:center"><div style="font-size:2rem;font-weight:700;color:var(--green)">${atc}</div><div style="color:var(--muted);font-size:.84rem">Approved Today</div></div>
+    <div class="card" style="text-align:center"><div style="font-size:2rem;font-weight:700;color:${ocColor}">${oc}</div><div style="color:var(--muted);font-size:.84rem">Overdue (&gt;3d)</div></div>
+  </div>`;
+
+  const bySys=data.by_system||{};
+  if(Object.keys(bySys).length) {
+    h+=`<div class="card" style="margin-bottom:16px"><div class="card-header"><span class="card-title">By System</span></div><div style="display:flex;gap:16px;flex-wrap:wrap">`;
+    const sysColors={'Concur Expense':'var(--blue)','ServiceNow':'var(--orange)','DocuSign':'var(--accent)'};
+    for(const [sys,cnt] of Object.entries(bySys)) {
+      const c=sysColors[sys]||'var(--muted)';
+      h+=`<div style="display:flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:${c};display:inline-block"></span><span style="font-size:.88rem">${escHtml(sys)}: <strong>${cnt}</strong></span></div>`;
+    }
+    h+=`</div></div>`;
+  }
+
+  const pending=data.pending||[];
+  h+=`<div class="card"><div class="card-header"><span class="card-title">Pending Approvals (${pending.length})</span></div>`;
+  if(pending.length===0) {
+    h+=`<p style="color:var(--green);text-align:center;padding:24px">All clear — no pending approvals.</p>`;
+  } else {
+    h+=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.84rem">
+      <thead><tr style="border-bottom:2px solid var(--border);text-align:left">
+        <th style="padding:8px 12px">System</th><th style="padding:8px 12px">Subject</th><th style="padding:8px 12px">From</th><th style="padding:8px 12px">Age</th><th style="padding:8px 12px">Actions</th>
+      </tr></thead><tbody>`;
+    for(const item of pending) {
+      const age=item.received_at?Math.floor((Date.now()-new Date(item.received_at).getTime())/(86400000))+'d':'?';
+      const ageColor=parseInt(age)>3?'var(--red)':parseInt(age)>1?'var(--yellow)':'var(--text)';
+      const sysLabel=item.display_name||item.system||'';
+      const linkBtn=item.link?`<a href="${escHtml(item.link)}" target="_blank" class="btn btn-sm" style="text-decoration:none;margin-right:4px">Open</a>`:'';
+      h+=`<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px 12px"><span class="badge" style="background:rgba(108,124,255,.15);color:var(--accent)">${escHtml(sysLabel)}</span></td>
+        <td style="padding:8px 12px">${escHtml(item.subject||'')}</td>
+        <td style="padding:8px 12px;color:var(--muted)">${escHtml(item.from||'')}</td>
+        <td style="padding:8px 12px;color:${ageColor};font-weight:600">${age}</td>
+        <td style="padding:8px 12px;white-space:nowrap">${linkBtn}<button class="btn btn-sm btn-green" onclick="approvalAction('${escHtml(item.approval_id)}','approved',this)">Approve</button> <button class="btn btn-sm" onclick="approvalAction('${escHtml(item.approval_id)}','dismissed',this)">Dismiss</button></td>
+      </tr>`;
+    }
+    h+=`</tbody></table></div>`;
+  }
+  h+=`</div>`;
+
+  const closed=data.recently_closed||[];
+  if(closed.length) {
+    h+=`<div class="card" style="margin-top:16px"><div class="card-header"><span class="card-title">Recently Closed (7 days)</span></div>`;
+    h+=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.84rem">
+      <thead><tr style="border-bottom:2px solid var(--border);text-align:left">
+        <th style="padding:8px 12px">Status</th><th style="padding:8px 12px">System</th><th style="padding:8px 12px">Subject</th><th style="padding:8px 12px">Closed</th><th style="padding:8px 12px">Evidence</th>
+      </tr></thead><tbody>`;
+    for(const item of closed) {
+      const statusColor=item.status==='approved'?'var(--green)':'var(--muted)';
+      const closedDate=(item.status_changed_at||'').slice(0,10);
+      const evidence=item.evidence?escHtml(item.evidence.snippet||'').slice(0,60)+'...':'Manual';
+      h+=`<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px 12px"><span style="color:${statusColor};font-weight:600;text-transform:capitalize">${item.status}</span></td>
+        <td style="padding:8px 12px">${escHtml(item.display_name||item.system||'')}</td>
+        <td style="padding:8px 12px">${escHtml(item.subject||'')}</td>
+        <td style="padding:8px 12px;color:var(--muted)">${closedDate}</td>
+        <td style="padding:8px 12px;color:var(--muted);font-size:.78rem">${evidence}</td>
+      </tr>`;
+    }
+    h+=`</tbody></table></div></div>`;
+  }
+
+  const analysis=data.analysis||{};
+  if(analysis.oldest_pending_days>0||analysis.busiest_system!=='none') {
+    h+=`<div class="card" style="margin-top:16px"><div class="card-header"><span class="card-title">Analysis</span></div>`;
+    if(analysis.oldest_pending_days>0) h+=`<div class="stat-row"><span class="stat-label">Oldest pending</span><span class="stat-value">${analysis.oldest_pending_days} days</span></div>`;
+    if(analysis.busiest_system&&analysis.busiest_system!=='none') h+=`<div class="stat-row"><span class="stat-label">Busiest system</span><span class="stat-value">${escHtml(analysis.busiest_system)}</span></div>`;
+    h+=`</div>`;
+  }
+  return h;
+}
+
+async function approvalAction(approvalId, action, btn) {
+  btn.disabled=true; btn.textContent='...';
+  try {
+    const r=await fetch('/api/approvals/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:approvalId,action:action})});
+    if(r.ok) {
+      btn.textContent='Done';
+      btn.style.color='var(--green)';
+      setTimeout(()=>{
+        const today=new Date().toISOString().slice(0,10);
+        fetch('/api/agents/reports/approvals-queue/'+today+'/json').then(r=>r.ok?r.json():null).then(d=>{
+          if(d) {
+            const body=document.getElementById('rich-view-body')||document.getElementById('report-body');
+            if(body) body.innerHTML=renderApprovalsQueue(d);
+          }
+        });
+      },1500);
+    } else {
+      const d=await r.json();
+      btn.textContent=d.error||'Error'; btn.style.color='var(--red)';
+    }
+  } catch(e) { btn.textContent='Error'; btn.style.color='var(--red)'; }
+}
+
 function closeRichView() {
   document.getElementById('rich-view-overlay').classList.remove('open');
   document.body.style.overflow='';
+}
+function downloadPDF() {
+  const cards = document.querySelectorAll('.np-card');
+  cards.forEach(c => c.classList.add('expanded'));
+  const origTitle = document.title;
+  const titleEl = document.getElementById('rich-view-title') || document.querySelector('.report-header h1');
+  const dateEl = document.getElementById('rich-view-date') || document.querySelector('.report-header .date');
+  if (titleEl && dateEl) document.title = titleEl.textContent + ' - ' + dateEl.textContent;
+
+  document.querySelectorAll('canvas').forEach(canvas => {
+    try {
+      const img = document.createElement('img');
+      img.src = canvas.toDataURL('image/png');
+      img.style.cssText = 'max-width:100%;height:auto;border-radius:12px;';
+      img.className = 'chart-print-img';
+      canvas.parentNode.insertBefore(img, canvas);
+      canvas.style.display = 'none';
+      canvas.dataset.printHidden = '1';
+    } catch(e) {}
+  });
+
+  const html = document.documentElement;
+  const wasLight = html.classList.contains('exec-light');
+  if (!wasLight) html.classList.add('exec-light');
+
+  setTimeout(() => {
+    window.print();
+    document.title = origTitle;
+    if (!wasLight) html.classList.remove('exec-light');
+    document.querySelectorAll('canvas[data-print-hidden]').forEach(c => {
+      c.style.display = '';
+      delete c.dataset.printHidden;
+      const img = c.parentNode.querySelector('.chart-print-img');
+      if (img) img.remove();
+    });
+  }, 200);
 }
 
 /* ═══ Chart.js Helpers (Nuclear Overhaul) ═══ */
@@ -3622,18 +6703,44 @@ function createDoughnutChart(canvasId, labels, values, colors) {
   new Chart(el,{type:'doughnut',data:{labels:labels,datasets:[{data:values,backgroundColor:colors,borderWidth:0}]},options:{responsive:true,cutout:'55%',plugins:{legend:{labels:{color:'#9ca3af',font:{size:11}}}}}});
 }
 
+function _fmtAnalysis(text) {
+  if(!text) return '';
+  if(Array.isArray(text)) text=text.join('\n');
+  if(typeof text!=='string') text=String(text);
+  const lines=text.split(/\n/).map(l=>l.trim()).filter(Boolean);
+  if(lines.length<=1&&text.length<200) return `<div class="rv-analysis-text">${escHtml(text)}</div>`;
+  let out='<ul style="margin:4px 0 0 16px;font-size:.84rem;line-height:1.55">';
+  lines.forEach(l=>{
+    let clean=l.replace(/^[-–•*]\s*/,'').replace(/^\d+[.)]\s*/,'');
+    if(!clean) return;
+    out+=`<li style="margin-bottom:5px">${escHtml(clean)}</li>`;
+  });
+  out+='</ul>';
+  return out;
+}
 function renderAnalysisCard(analysis) {
   if(!analysis) return '';
   let h='<div class="rv-analysis">';
-  if(analysis.executive_insight) h+=`<div class="rv-analysis-insight">${escHtml(analysis.executive_insight)}</div>`;
+  if(analysis.executive_insight) {
+    const ei=analysis.executive_insight;
+    const paras=ei.split(/\n\n|\n(?=[A-Z])/);
+    const first=paras[0]||'';
+    const rest=paras.slice(1).join('\n');
+    h+=`<div class="rv-analysis-insight">${escHtml(first)}</div>`;
+    if(rest.trim()) {
+      const detailId='analysis-detail-'+Math.random().toString(36).slice(2,8);
+      h+=`<div id="${detailId}" style="display:none;margin-top:8px">${_fmtAnalysis(rest)}</div>`;
+      h+=`<button onclick="var d=document.getElementById('${detailId}');var s=d.style.display==='none';d.style.display=s?'block':'none';this.textContent=s?'Hide details':'Show details'" style="background:none;border:none;color:var(--accent);font-size:.78rem;cursor:pointer;padding:4px 0;font-weight:600">Show details</button>`;
+    }
+  }
   h+='<div class="rv-analysis-row">';
-  if(analysis.biggest_risk) h+=`<div class="rv-analysis-item"><div class="rv-analysis-label">Biggest Risk</div><div class="rv-analysis-text" style="color:var(--red)">${escHtml(analysis.biggest_risk)}</div></div>`;
-  if(analysis.recommended_focus) h+=`<div class="rv-analysis-item"><div class="rv-analysis-label">Recommended Focus</div><div class="rv-analysis-text" style="color:var(--green)">${escHtml(analysis.recommended_focus)}</div></div>`;
+  if(analysis.biggest_risk) h+=`<div class="rv-analysis-item"><div class="rv-analysis-label">Biggest Risk</div>${_fmtAnalysis(analysis.biggest_risk)}</div>`;
+  if(analysis.recommended_focus) h+=`<div class="rv-analysis-item"><div class="rv-analysis-label">Recommended Focus</div>${_fmtAnalysis(analysis.recommended_focus)}</div>`;
   h+='</div>';
   if(analysis.predictions&&analysis.predictions.length) {
-    h+='<div style="margin-top:12px"><div class="rv-analysis-label">Predictions</div>';
-    analysis.predictions.forEach(p=>{h+=`<div class="rv-analysis-text" style="margin-bottom:4px">&#8226; ${escHtml(p)}</div>`;});
-    h+='</div>';
+    h+='<div style="margin-top:12px"><div class="rv-analysis-label">Predictions</div><ul style="margin:4px 0 0 16px;font-size:.84rem">';
+    analysis.predictions.forEach(p=>{h+=`<li style="margin-bottom:5px">${escHtml(p)}</li>`;});
+    h+='</ul></div>';
   }
   h+='</div>';
   return h;
@@ -3646,6 +6753,106 @@ function renderScoreBadge(score, label, id) {
 function renderProgressBar(percent, color) {
   const c=color||(percent>=75?'green':percent>=50?'yellow':'red');
   return `<div class="rv-progress"><div class="rv-progress-bar rv-progress-bar-${c}" style="width:${Math.min(100,percent||0)}%"></div></div>`;
+}
+
+/* ═══ Shared: Executive Header Renderer ═══ */
+function renderExecutiveHeader(data, skillName) {
+  const eh = data.executive_header;
+  const heroImg = data.hero_image || (eh && eh.hero_image) || '';
+  const bluf = (eh && eh.bluf) || data.day_summary || data.executive_summary || data.summary || '';
+  const status = (eh && eh.status) || '';
+  const metrics = (eh && eh.metrics) || [];
+
+  let h = '<div class="exec-header">';
+  if (heroImg) {
+    h += `<img class="exec-header-hero" src="${escHtml(heroImg)}" alt="" onerror="this.style.display='none';this.nextElementSibling.classList.add('exec-header-no-hero')">`;
+    h += '<div class="exec-header-overlay">';
+  } else {
+    h += '<div class="exec-header-no-hero">';
+  }
+
+  if (status) {
+    const sc = status === 'green' ? 'exec-header-status-green' : status === 'red' ? 'exec-header-status-red' : 'exec-header-status-yellow';
+    const labels = { green: 'On Track', yellow: 'Watch', red: 'Attention Needed' };
+    h += `<div class="exec-header-status ${sc}">${labels[status] || status}</div>`;
+  }
+
+  if (bluf) h += `<div class="exec-header-bluf">${escHtml(bluf)}</div>`;
+
+  if (metrics.length) {
+    h += '<div class="exec-header-metrics">';
+    metrics.forEach(raw => {
+      let m = raw;
+      if (typeof m === 'string') {
+        const idx = m.indexOf(':');
+        m = idx >= 0 ? { label: m.slice(0, idx).trim(), value: m.slice(idx + 1).trim() } : { label: m, value: '' };
+      }
+      const colorMap = { green: '#34D399', red: '#FCA5A5', yellow: '#FBBF24', accent: '#A5B4FC' };
+      const valColor = m.color ? (colorMap[m.color] || '#fff') : '#fff';
+      h += `<div class="exec-header-kpi">
+        <div class="exec-header-kpi-value" style="color:${valColor}">${escHtml(String(m.value || '0'))}</div>
+        <div class="exec-header-kpi-label">${escHtml(m.label || '')}</div>`;
+      if (m.trend) {
+        const tCls = m.trend > 0 ? 'exec-header-kpi-trend-up' : 'exec-header-kpi-trend-down';
+        h += `<div class="exec-header-kpi-trend ${tCls}">${m.trend > 0 ? '&#9650;' : '&#9660;'} ${Math.abs(m.trend)}</div>`;
+      }
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  h += '</div></div>';
+  return h;
+}
+
+function renderThreeMoves(moves) {
+  if (!moves || !moves.length) return '';
+  let h = '<div class="rv-section"><div class="rv-section-title">Your Three Moves</div><div class="exec-moves">';
+  moves.slice(0, 3).forEach((m, i) => {
+    h += `<div class="exec-move">
+      <div class="exec-move-num">${i + 1}</div>
+      <div class="exec-move-title">${escHtml(m.action || m.title || '')}</div>
+      <div class="exec-move-detail">${escHtml(m.detail || m.impact || m.reason || '')}</div>
+      ${m.time_needed ? `<div class="exec-move-time">${escHtml(m.time_needed)}</div>` : ''}
+    </div>`;
+  });
+  h += '</div></div>';
+  return h;
+}
+
+function renderTalkingPoints(points) {
+  if (!points || !points.length) return '';
+  let h = '<div class="exec-talking-points"><div class="exec-talking-points-title"><span style="font-size:1.1rem">&#128172;</span> Talking Points for Today</div>';
+  points.forEach(p => {
+    h += `<div class="exec-talking-point">${escHtml(typeof p === 'string' ? p : p.point || p.text || '')}</div>`;
+  });
+  h += '</div>';
+  return h;
+}
+
+function renderStakeholderHeat(commitments) {
+  if (!commitments || !commitments.length) return '';
+  const byPerson = {};
+  commitments.forEach(c => {
+    const name = c.owed_to || c.requestor || 'Unknown';
+    if (!byPerson[name]) byPerson[name] = { total: 0, overdue: 0 };
+    byPerson[name].total++;
+    if (c.status === 'overdue' || c.status === 'Overdue' || c._overdue) byPerson[name].overdue++;
+  });
+  const entries = Object.entries(byPerson).sort((a, b) => b[1].total - a[1].total);
+  if (!entries.length) return '';
+  let h = '<div class="rv-section"><div class="rv-section-title">Stakeholder Exposure</div><div class="exec-stakeholder-heat">';
+  entries.forEach(([name, info]) => {
+    const bg = info.overdue > 0 ? 'rgba(220,38,38,0.08)' : info.total >= 3 ? 'rgba(217,119,6,0.08)' : 'rgba(5,150,105,0.06)';
+    const countColor = info.overdue > 0 ? 'var(--red)' : info.total >= 3 ? 'var(--yellow)' : 'var(--green)';
+    h += `<div class="exec-stakeholder-card" style="background:${bg}">
+      <div class="exec-stakeholder-name">${escHtml(name)}</div>
+      <div class="exec-stakeholder-count" style="color:${countColor}">${info.total}</div>
+      <div class="exec-stakeholder-label">${info.overdue ? info.overdue + ' overdue' : 'items'}</div>
+    </div>`;
+  });
+  h += '</div></div>';
+  return h;
 }
 
 /* ═══ Rich View: News Pulse (Single-Column Accordion) ═══ */
@@ -3692,6 +6899,17 @@ function renderNewsPulse(data) {
   const srcIcons={email:'&#9993;',meeting:'&#128197;',teams:'&#128172;',activity:'&#128187;'};
   let totalArticles=0;
   let h='';
+
+  const ehData = data.executive_header || {
+    bluf: data.bottom_line || '',
+    hero_image: data.hero_image || '',
+    metrics: [
+      {label:'Stories',value:data.story_count||0},
+      {label:'Topics',value:data.topic_count||0},
+      {label:'Internal Signals',value:internal.length,color:internal.some(s=>s.urgency==='high')?'red':'accent'}
+    ]
+  };
+  if(ehData.bluf || data.hero_image) h += renderExecutiveHeader({...data, executive_header:ehData}, 'news-pulse');
 
   if(internal.length) {
     h+=`<div class="np-section-label internal">Internal Signals (${internal.length})</div>`;
@@ -3744,8 +6962,11 @@ function renderNewsPulse(data) {
     });
   });
 
+  const tp = data.talking_points || [];
+  if(tp.length) h += renderTalkingPoints(tp);
+
   const countText=`${data.story_count||totalArticles} stories across ${data.topic_count||topics.length} topics`;
-  return `<div style="margin-bottom:16px;font-size:.84rem;color:var(--muted);text-align:center">${countText}</div><div class="np-feed">${h}</div>`;
+  return `${h?'<div class="np-feed">'+h+'</div>':'<div style="margin-bottom:16px;font-size:.84rem;color:var(--muted);text-align:center">'+countText+'</div><div class="np-feed">'+h+'</div>'}`;
 }
 
 function npToggle(id) {
@@ -3764,17 +6985,33 @@ function renderWeeklyStatus(data) {
   const m=data.metrics||{};
   const cs=m.commitment_score||{};
   let h=``;
-  if(data.hero_image) h+=`<img class="rv-hero" src="${escHtml(data.hero_image)}" alt="" onerror="this.style.display='none'">`;
-  h+=`<div class="rv-metrics">
-    <div class="rv-metric"><div class="rv-metric-value">${m.meetings_total||0}</div><div class="rv-metric-label">Meetings</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${m.emails_received||0}</div><div class="rv-metric-label">Emails Received</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${m.emails_sent||0}</div><div class="rv-metric-label">Emails Sent</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${m.accomplishments_count||0}</div><div class="rv-metric-label">Accomplishments</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${cs.percent||0}%</div><div class="rv-metric-label">Commitment Score (${cs.delivered||0}/${cs.total||0})</div></div>
-  </div>`;
-  if(data.summary) h+=`<div class="rv-card" style="margin-bottom:24px"><div class="rv-card-body">${escHtml(data.summary)}</div></div>`;
+
+  const wow=data.week_over_week||data.trend_vs_prior_week||{};
+  const ehData = data.executive_header || {
+    bluf: data.summary || '',
+    hero_image: data.hero_image || '',
+    status: (cs.percent||0) >= 75 ? 'green' : (cs.percent||0) >= 50 ? 'yellow' : 'red',
+    metrics: [
+      {label:'Commitment Score',value:(cs.percent||0)+'%',color:(cs.percent||0)>=75?'green':(cs.percent||0)>=50?'yellow':'red'},
+      {label:'Accomplishments',value:m.accomplishments_count||0,color:'green'},
+      {label:'Meetings',value:m.meetings_total||0,trend:wow.meetings_delta},
+      {label:'Emails Sent',value:m.emails_sent||0,trend:wow.emails_delta}
+    ]
+  };
+  h += renderExecutiveHeader({...data, executive_header:ehData}, 'weekly-status');
+
+  const vd=data.value_delivered||[];
+  if(vd.length) {
+    h+=`<div class="rv-section"><div class="rv-section-title">Impact Delivered</div>`;
+    vd.forEach(v=>{
+      h+=`<div class="rv-card" style="border-left:4px solid var(--green)"><div class="rv-card-title">${escHtml(v.statement||'')}</div>
+        <div class="rv-card-body">${escHtml(v.detail||'')}</div>
+        ${v.evidence_path?`<div class="rv-card-meta">${escHtml(v.evidence_path)}</div>`:''}</div>`;
+    });
+    h+=`</div>`;
+  }
+
   h+=renderAnalysisCard(data.analysis);
-  const wow=data.week_over_week||{};
   if(wow.meetings_delta!=null||wow.emails_delta!=null) {
     h+=`<div class="rv-metrics">`;
     if(wow.meetings_delta!=null) {const c=wow.meetings_delta<=0?'var(--green)':'var(--red)';h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${c}">${wow.meetings_delta>=0?'+':''}${wow.meetings_delta}</div><div class="rv-metric-label">Meetings WoW</div></div>`;}
@@ -3806,16 +7043,6 @@ function renderWeeklyStatus(data) {
         <span class="rv-pill ${sc[p.status]||'rv-pill-gray'}">${escHtml(p.status||'')}</span>
         <div style="flex:1"><div class="rv-card-title">${escHtml(p.item||'')}</div>
         <div class="rv-card-meta">${escHtml(p.source||'')} ${p.evidence?'— '+escHtml(p.evidence):''}</div></div></div>`;
-    });
-    h+=`</div>`;
-  }
-  const vd=data.value_delivered||[];
-  if(vd.length) {
-    h+=`<div class="rv-section"><div class="rv-section-title">Value Delivered</div>`;
-    vd.forEach(v=>{
-      h+=`<div class="rv-card"><div class="rv-card-title">${escHtml(v.statement||'')}</div>
-        <div class="rv-card-body">${escHtml(v.detail||'')}</div>
-        ${v.evidence_path?`<div class="rv-card-meta">${escHtml(v.evidence_path)}</div>`:''}</div>`;
     });
     h+=`</div>`;
   }
@@ -3856,22 +7083,59 @@ function initWeeklyStatusCharts(data) {
 /* ═══ Rich View: Plan My Week ═══ */
 function renderPlanMyWeek(data) {
   let h='';
-  if(data.hero_image) h+=`<img class="rv-hero" src="${escHtml(data.hero_image)}" alt="" onerror="this.style.display='none'">`;
-  h+=`<div class="rv-gauge-wrap">`;
-  h+=renderScoreBadge(data.week_score,'Week Score','pmw-score-gauge');
-  h+=`<div style="flex:1">`;
-  if(data.executive_summary) h+=`<div class="rv-card" style="margin-bottom:0;border-left:4px solid var(--accent)"><div class="rv-card-body" style="font-size:.95rem">${escHtml(data.executive_summary)}</div></div>`;
-  h+=`</div></div>`;
+
+  const dels=data.deliverables||[];
+  const ehData = data.executive_header || {
+    bluf: data.this_weeks_bet || data.executive_summary || '',
+    hero_image: data.hero_image || '',
+    status: (data.week_score||0) >= 70 ? 'green' : (data.week_score||0) >= 45 ? 'yellow' : 'red',
+    metrics: [
+      {label:'Week Score',value:data.week_score||0,color:(data.week_score||0)>=70?'green':(data.week_score||0)>=45?'yellow':'red'},
+      {label:'Meeting Hours',value:(data.total_meeting_hours||0).toFixed(1)+'h'},
+      {label:'Focus Hours',value:(data.total_focus_hours||0).toFixed(1)+'h',color:'green'},
+      {label:'Deliverables',value:dels.length}
+    ]
+  };
+  h += renderExecutiveHeader({...data, executive_header:ehData}, 'plan-my-week');
+
+  const wp=data.week_progress;
+  if(wp) {
+    h+=`<div class="rv-week-progress">
+      <div class="rv-week-progress-label">Day ${wp.current_day} of ${wp.total_days}</div>
+      <div class="rv-week-progress-track"><div class="rv-week-progress-fill" style="width:${wp.percent}%"></div></div>
+      <div class="rv-week-progress-pct">${wp.percent}% through week</div>
+    </div>`;
+  }
+
   h+=renderAnalysisCard(data.analysis);
+
+  /* Metrics: Planned vs Actual */
   const tvp=data.trend_vs_prior_week||{};
-  if(tvp.delta_meetings_hours!=null||tvp.delta_focus_hours!=null) {
-    h+=`<div class="rv-metrics">`;
-    if(tvp.delta_meetings_hours!=null) { const c=tvp.delta_meetings_hours<=0?'var(--green)':'var(--red)';h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${c}">${tvp.delta_meetings_hours>=0?'+':''}${tvp.delta_meetings_hours.toFixed(1)}h</div><div class="rv-metric-label">Meetings vs Last Week</div></div>`; }
-    if(tvp.delta_focus_hours!=null) { const c=tvp.delta_focus_hours>=0?'var(--green)':'var(--red)';h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${c}">${tvp.delta_focus_hours>=0?'+':''}${tvp.delta_focus_hours.toFixed(1)}h</div><div class="rv-metric-label">Focus vs Last Week</div></div>`; }
-    if(data.total_meeting_hours!=null) h+=`<div class="rv-metric"><div class="rv-metric-value">${data.total_meeting_hours.toFixed(1)}h</div><div class="rv-metric-label">Total Meetings</div></div>`;
-    if(data.total_focus_hours!=null) h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:var(--green)">${data.total_focus_hours.toFixed(1)}h</div><div class="rv-metric-label">Total Focus</div></div>`;
+  const hasActuals=data.actual_total_meeting_hours!=null;
+  h+=`<div class="rv-metrics">`;
+  if(tvp.delta_meetings_hours!=null) { const c=tvp.delta_meetings_hours<=0?'var(--green)':'var(--red)';h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${c}">${tvp.delta_meetings_hours>=0?'+':''}${tvp.delta_meetings_hours.toFixed(1)}h</div><div class="rv-metric-label">Meetings vs Last Week</div></div>`; }
+  if(tvp.delta_focus_hours!=null) { const c=tvp.delta_focus_hours>=0?'var(--green)':'var(--red)';h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${c}">${tvp.delta_focus_hours>=0?'+':''}${tvp.delta_focus_hours.toFixed(1)}h</div><div class="rv-metric-label">Focus vs Last Week</div></div>`; }
+  if(data.total_meeting_hours!=null) {
+    const pm=data.total_meeting_hours, am=data.actual_total_meeting_hours;
+    h+=`<div class="rv-metric"><div class="rv-metric-value">${pm.toFixed(1)}h</div><div class="rv-metric-label">Total Meetings</div>`;
+    if(hasActuals) {
+      const d=am-pm, cls=d<=0?'rv-metric-delta-good':'rv-metric-delta-bad';
+      h+=`<div class="rv-metric-compare"><span class="rv-metric-planned">Plan ${pm.toFixed(1)}h</span><span class="rv-metric-actual">Actual <strong>${am.toFixed(1)}h</strong></span><span class="rv-metric-delta ${cls}">${d>=0?'+':''}${d.toFixed(1)}</span></div>`;
+    }
     h+=`</div>`;
   }
+  if(data.total_focus_hours!=null) {
+    const pf=data.total_focus_hours, af=data.actual_total_focus_hours;
+    h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:var(--green)">${pf.toFixed(1)}h</div><div class="rv-metric-label">Total Focus</div>`;
+    if(hasActuals) {
+      const d=af-pf, cls=d>=0?'rv-metric-delta-good':'rv-metric-delta-bad';
+      h+=`<div class="rv-metric-compare"><span class="rv-metric-planned">Plan ${pf.toFixed(1)}h</span><span class="rv-metric-actual">Actual <strong>${af.toFixed(1)}h</strong></span><span class="rv-metric-delta ${cls}">${d>=0?'+':''}${d.toFixed(1)}</span></div>`;
+    }
+    h+=`</div>`;
+  }
+  h+=`</div>`;
+
+  /* Day Cards with status indicators and actuals */
   const days=data.days||[];
   if(days.length) {
     h+=`<div class="rv-day-strip">`;
@@ -3879,18 +7143,33 @@ function renderPlanMyWeek(data) {
       const mc=d.meetings||{};
       const dens=d.density||'moderate';
       const cap=d.capacity_percent||0;
+      const ds=d.day_status||'future';
+      const statusCls=ds==='completed'?'rv-day-status-completed':ds==='in_progress'?'rv-day-status-today':'rv-day-status-future';
       h+=`<div class="rv-day-card rv-day-density-${dens}" onclick="showDayDetail(${i})">
         <div class="rv-day-card-name">${escHtml(d.day_name||'')}</div>
         <div class="rv-day-card-date">${escHtml(d.date||'')}</div>
+        <div class="rv-day-status ${statusCls}"></div>
         <div class="rv-day-card-meetings" style="color:${dens==='heavy'?'var(--red)':dens==='moderate'?'#facc15':'var(--green)'}">${mc.count||0}</div>
         <div class="rv-day-card-hours">${mc.hours||0}h mtgs</div>
         ${renderProgressBar(cap, cap>75?'red':cap>50?'yellow':'green')}
-        <div style="font-size:.66rem;color:var(--muted);margin-top:2px">${Math.round(cap)}% capacity</div>
-      </div>`;
+        <div style="font-size:.66rem;color:var(--muted);margin-top:2px">${Math.round(cap)}% capacity</div>`;
+      if(ds!=='future'&&d.actual_meeting_hours!=null) {
+        const amh=d.actual_meeting_hours, pmh=mc.hours||0;
+        const mCls=amh<=pmh?'rv-day-actual-good':'rv-day-actual-bad';
+        const afh=d.actual_focus_hours||0, pfh=d.focus_hours||0;
+        const fCls=afh>=pfh?'rv-day-actual-good':'rv-day-actual-bad';
+        h+=`<div class="rv-day-actual">
+          <div>Actual: <span class="rv-day-actual-val ${mCls}">${amh}h</span> mtg</div>
+          <div>Focus: <span class="rv-day-actual-val ${fCls}">${afh}h</span></div>
+        </div>`;
+      }
+      h+=`</div>`;
     });
     h+=`</div>`;
-    h+=`<div class="rv-chart-container"><div class="rv-section-title">Daily Meeting vs Focus</div><canvas id="pmw-capacity-chart"></canvas></div>`;
+    h+=`<div class="rv-chart-container"><div class="rv-section-title">Daily Meeting vs Focus (Planned vs Actual)</div><canvas id="pmw-capacity-chart"></canvas></div>`;
   }
+
+  /* Priorities */
   const pris=data.priorities||[];
   if(pris.length) {
     h+=`<div class="rv-section"><div class="rv-section-title">Priorities</div>`;
@@ -3903,22 +7182,41 @@ function renderPlanMyWeek(data) {
     });
     h+=`</div>`;
   }
-  const dels=data.deliverables||[];
+
+  /* Deliverables Timeline with today marker and status coloring */
   if(dels.length) {
     h+=`<div class="rv-section"><div class="rv-section-title">Deliverables Timeline</div><div class="rv-gantt">`;
     const dayNames=days.map(d=>d.day_name||d.date);
-    h+=`<div class="rv-gantt-row"><div class="rv-gantt-label"></div><div class="rv-gantt-track" style="display:flex;background:none;gap:2px">`;
-    dayNames.forEach(dn=>{h+=`<div style="flex:1;text-align:center;font-size:.7rem;color:var(--muted)">${escHtml(dn.slice(0,3))}</div>`;});
+    const todayIdx=days.findIndex(d=>d.day_status==='in_progress');
+    h+=`<div class="rv-gantt-row"><div class="rv-gantt-label"></div><div class="rv-gantt-track" style="display:flex;background:none;gap:2px;position:relative">`;
+    dayNames.forEach((dn,di)=>{
+      const ds=(days[di]||{}).day_status||'future';
+      const bg=ds==='completed'?'rgba(74,222,128,.08)':ds==='in_progress'?'rgba(108,124,255,.08)':'transparent';
+      h+=`<div style="flex:1;text-align:center;font-size:.7rem;color:${ds==='in_progress'?'var(--accent)':'var(--muted)'};font-weight:${ds==='in_progress'?'700':'400'};background:${bg};border-radius:4px;padding:2px 0">${escHtml(dn.slice(0,3))}</div>`;
+    });
     h+=`</div></div>`;
     dels.forEach(dl=>{
       const dayIdx=days.findIndex(d=>d.day_name===dl.planned_day||d.date===dl.planned_day);
       const left=dayIdx>=0?(dayIdx/Math.max(days.length,1)*100)+'%':'0%';
-      const barColor=dl.status==='Overdue'||dl.status==='overdue'?'var(--red)':dl.status==='Due'?'#facc15':'var(--accent)';
+      const isOverdue=dl.status==='Overdue'||dl.status==='overdue';
+      const isDue=dl.status==='Due';
+      const barColor=isOverdue?'var(--red)':isDue?'#facc15':'var(--accent)';
+      const isPast=dayIdx>=0&&days[dayIdx]&&(days[dayIdx].day_status==='completed'||days[dayIdx].day_status==='in_progress');
+      const statusLabel=isPast&&isOverdue?'OVD':isPast?'...':dl.status?(dl.status).slice(0,3):'';
       h+=`<div class="rv-gantt-row"><div class="rv-gantt-label" title="${escHtml(dl.name)}">${escHtml(dl.name||'')}</div>
-        <div class="rv-gantt-track"><div class="rv-gantt-bar" style="background:${barColor};width:${100/Math.max(days.length,1)}%;margin-left:${left}">${escHtml((dl.status||'').slice(0,3))}</div></div></div>`;
+        <div class="rv-gantt-track" style="position:relative">
+          <div class="rv-gantt-bar" style="background:${barColor};width:${100/Math.max(days.length,1)}%;margin-left:${left};opacity:${isPast?'0.5':'1'}">${escHtml(statusLabel)}</div>`;
+      if(todayIdx>=0) {
+        const markerLeft=((todayIdx+0.5)/Math.max(days.length,1)*100)+'%';
+        h+=`<div class="rv-gantt-today-marker" style="left:${markerLeft}"></div>`;
+      }
+      h+=`</div></div>`;
     });
-    h+=`</div></div>`;
+    h+=`</div>`;
+    h+=`<div class="rv-gantt-legend"><span><span class="rv-gantt-legend-dot" style="background:var(--accent)"></span>Planned</span><span><span class="rv-gantt-legend-dot" style="background:var(--red)"></span>Overdue</span><span><span class="rv-gantt-legend-dot" style="background:#facc15"></span>Due</span></div>`;
+    h+=`</div>`;
   }
+
   h+=`<div id="pmw-day-detail"></div>`;
   window._pmwData=data;
   const cyo=data.commitments_you_owe||[];
@@ -3959,10 +7257,28 @@ function showDayDetail(idx) {
   if(!d) return;
   const el=document.getElementById('pmw-day-detail');
   const mc=d.meetings||{};
-  let h=`<div class="rv-section" style="margin-top:16px"><div class="rv-section-title">${escHtml(d.day_name||'')} ${escHtml(d.date||'')}</div>`;
+  const ds=d.day_status||'future';
+  const statusLabel=ds==='completed'?'Completed':ds==='in_progress'?'In Progress':'Upcoming';
+  let h=`<div class="rv-section" style="margin-top:16px"><div class="rv-section-title">${escHtml(d.day_name||'')} ${escHtml(d.date||'')} <span class="rv-pill ${ds==='completed'?'rv-pill-green':ds==='in_progress'?'rv-pill-blue':'rv-pill-gray'}" style="margin-left:8px;vertical-align:middle">${statusLabel}</span></div>`;
+
+  if(ds!=='future'&&d.actual_meeting_hours!=null) {
+    h+=`<div class="rv-metrics" style="margin-bottom:16px">
+      <div class="rv-metric"><div class="rv-metric-value">${mc.hours||0}h</div><div class="rv-metric-label">Planned Meetings</div></div>
+      <div class="rv-metric"><div class="rv-metric-value" style="color:${d.actual_meeting_hours<=(mc.hours||0)?'var(--green)':'var(--red)'}">${d.actual_meeting_hours}h</div><div class="rv-metric-label">Actual Meetings</div></div>
+      <div class="rv-metric"><div class="rv-metric-value">${d.focus_hours||0}h</div><div class="rv-metric-label">Planned Focus</div></div>
+      <div class="rv-metric"><div class="rv-metric-value" style="color:${(d.actual_focus_hours||0)>=(d.focus_hours||0)?'var(--green)':'var(--red)'}">${d.actual_focus_hours||0}h</div><div class="rv-metric-label">Actual Focus</div></div>
+      ${d.actual_email_count?`<div class="rv-metric"><div class="rv-metric-value">${d.actual_email_count}</div><div class="rv-metric-label">Emails</div></div>`:''}
+    </div>`;
+  }
+
   if((mc.names||[]).length) {
+    const attended=d.actual_meetings_attended||[];
     h+=`<div class="rv-card"><div class="rv-card-title">Meetings (${mc.count||0}, ${mc.hours||0}h)</div><ul style="margin:8px 0 0 16px;font-size:.86rem">`;
-    (mc.names||[]).forEach(n=>{h+=`<li>${escHtml(n)}</li>`;});
+    (mc.names||[]).forEach(n=>{
+      const wasAttended=attended.some(a=>a.toLowerCase().includes(n.toLowerCase())||n.toLowerCase().includes(a.toLowerCase()));
+      const icon=ds!=='future'?(wasAttended?'<span style="color:var(--green);margin-right:4px" title="Attended">&#10003;</span>':'<span style="color:var(--muted);margin-right:4px" title="No transcript">&#8211;</span>'):'';
+      h+=`<li>${icon}${escHtml(n)}</li>`;
+    });
     h+=`</ul></div>`;
   }
   if((d.priority_work||[]).length) {
@@ -3987,17 +7303,23 @@ function showDayDetail(idx) {
 /* ═══ Rich View: Morning Brief ═══ */
 function renderMorningBrief(data) {
   let h='';
-  if(data.hero_image) h+=`<img class="rv-hero" src="${escHtml(data.hero_image)}" alt="" onerror="this.style.display='none'">`;
-  h+=`<div class="rv-gauge-wrap">`;
-  h+=renderScoreBadge(data.day_score,'Day Score','mb-day-gauge');
-  h+=`<div style="flex:1">`;
-  if(data.day_summary) h+=`<div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">${escHtml(data.day_summary)}</div>`;
-  h+=`<div class="rv-metrics" style="margin-bottom:0">
-    <div class="rv-metric"><div class="rv-metric-value">${data.meeting_count||0}</div><div class="rv-metric-label">Meetings</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${data.priority_email_count||0}</div><div class="rv-metric-label">Priority Emails</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${data.unread_reply_count||0}</div><div class="rv-metric-label">Needs Reply</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${data.commitment_count||0}</div><div class="rv-metric-label">Commitments</div></div>
-  </div></div></div>`;
+
+  const ehData = data.executive_header || {
+    bluf: data.day_summary || '',
+    status: (data.day_score||0) >= 70 ? 'green' : (data.day_score||0) >= 45 ? 'yellow' : 'red',
+    hero_image: data.hero_image || '',
+    metrics: [
+      {label:'Day Score',value:data.day_score||0,color:(data.day_score||0)>=70?'green':(data.day_score||0)>=45?'yellow':'red'},
+      {label:'Meetings',value:data.meeting_count||0},
+      {label:'Need Reply',value:data.unread_reply_count||0,color:(data.unread_reply_count||0)>3?'red':'accent'},
+      {label:'Commitments',value:data.commitment_count||0}
+    ]
+  };
+  h += renderExecutiveHeader({...data, executive_header:ehData}, 'morning-brief');
+
+  const tm = data.three_moves || data.quick_wins || [];
+  if(tm.length) h += renderThreeMoves(tm.slice(0,3));
+
   h+=renderAnalysisCard(data.analysis);
   const em=data.energy_map||[];
   if(em.length) {
@@ -4018,6 +7340,36 @@ function renderMorningBrief(data) {
     h+=`</div>`;
   }
   h+=`</div>`;
+  /* Conflicts & Recommendations */
+  const conflicts=data.conflicts||[];
+  if(conflicts.length) {
+    h+=`<div class="rv-section"><div class="rv-section-title" style="color:var(--red)">Scheduling Conflicts (${conflicts.length})</div>`;
+    conflicts.forEach(c=>{
+      h+=`<div class="rv-card rv-severity-high" style="margin-bottom:12px">`;
+      h+=`<div class="rv-card-title" style="display:flex;align-items:center;gap:8px"><span style="font-size:1.1rem">&#9888;</span> ${escHtml(c.time_range||'')}</div>`;
+      h+=`<div style="margin:8px 0"><b>Overlapping:</b></div><ul style="margin:0 0 0 16px;font-size:.86rem">`;
+      (c.meetings||[]).forEach(m=>{h+=`<li>${escHtml(m)}</li>`;});
+      h+=`</ul>`;
+      if(c.recommendation) h+=`<div style="margin-top:10px;padding:10px 14px;background:rgba(108,124,255,.08);border-radius:8px;font-size:.86rem"><b style="color:var(--accent)">Recommendation:</b> ${escHtml(c.recommendation)}</div>`;
+      if(c.delegate_action) h+=`<div style="margin-top:6px;font-size:.82rem;color:var(--muted)"><b>Action:</b> ${escHtml(c.delegate_action)}</div>`;
+      h+=`</div>`;
+    });
+    h+=`</div>`;
+  }
+  /* Prep Tonight */
+  const prep=data.prep_tonight||[];
+  if(prep.length) {
+    h+=`<div class="rv-section"><div class="rv-section-title">Prep Tonight (Top ${prep.length})</div>`;
+    prep.sort((a,b)=>(a.priority||5)-(b.priority||5));
+    prep.forEach((p,i)=>{
+      const urgColor=p.priority<=2?'var(--red)':p.priority<=3?'#facc15':'var(--green)';
+      h+=`<div class="rv-card" style="display:flex;gap:14px;align-items:start">
+        <div style="width:32px;height:32px;border-radius:50%;background:${urgColor};display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:.9rem;flex-shrink:0">${i+1}</div>
+        <div style="flex:1"><div class="rv-card-title">${escHtml(p.task||'')}</div>
+        <div class="rv-card-meta">${p.related_meeting?'For: '+escHtml(p.related_meeting)+' &middot; ':''} ${escHtml(p.time_needed||'')}</div></div></div>`;
+    });
+    h+=`</div>`;
+  }
   const signals=data.signals||[];
   if(signals.length) {
     h+=`<div class="rv-section">`;
@@ -4041,36 +7393,126 @@ function renderMorningBrief(data) {
     });
     h+=`</div>`;
   }
-  const meetings=data.meetings||[];
-  if(meetings.length) {
-    h+=`<div class="rv-section"><div class="rv-section-title">Today's Calendar (${meetings.length} meetings)</div><div class="rv-timeline">`;
-    meetings.forEach(mtg=>{
-      const dotClass=mtg.priority||'medium';
-      h+=`<div class="rv-timeline-item"><div class="rv-timeline-dot ${dotClass}"></div>
-        <div class="rv-timeline-time">${escHtml(mtg.time||'')}</div>
-        <div class="rv-card"><div class="rv-card-title">${escHtml(mtg.title||'')}</div>`;
-      if(mtg.context) h+=`<div class="rv-card-body">${escHtml(mtg.context)}</div>`;
-      if(mtg.prior_notes) h+=`<div class="rv-card-meta" style="margin-top:6px;color:var(--accent)">Prior: ${escHtml(mtg.prior_notes)}</div>`;
+  const allDayItems=(data.meetings||[]).filter(m=>m.time==='00:00-23:59'||m.time==='All Day'||m.all_day);
+  const meetings=(data.meetings||[]).filter(m=>m.time!=='00:00-23:59'&&m.time!=='All Day'&&!m.all_day);
+  const totalCalItems = meetings.length + allDayItems.length;
+  if(totalCalItems) {
+    h+=`<div class="rv-section"><div class="rv-section-title">Today's Schedule (${totalCalItems} items)</div>`;
+    if(allDayItems.length) {
+      h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">`;
+      allDayItems.forEach(ad=>{
+        const t = ad.title || ad.name || ad.meeting || ad.summary || '';
+        h+=`<div class="rv-card" style="flex:1;min-width:180px;border-left:4px solid var(--blue);margin-bottom:0"><div class="rv-card-meta" style="margin-bottom:2px">All Day</div><div class="rv-card-title" style="font-size:.88rem">${escHtml(t)}</div></div>`;
+      });
+      h+=`</div>`;
+    }
+    const startH=7,endH=20;
+    h+=`<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin-bottom:20px;overflow:hidden">`;
+    for(let hr=startH;hr<endH;hr++){
+      const hrLabel=hr<10?'0'+hr:hr;
+      let mtgsInHr=0;
+      meetings.forEach(mtg=>{
+        const t=mtg.time||'';const parts=t.split('-');if(parts.length<2)return;
+        const [sh]=(parts[0]||'').split(':').map(Number);const [eh,em]=(parts[1]||'').split(':').map(Number);
+        if(!isNaN(sh)&&!isNaN(eh)&&!(sh>hr||eh<hr||(eh===hr&&em===0)))mtgsInHr++;
+      });
+      const isConflict=mtgsInHr>1;
+      h+=`<div style="display:flex;min-height:38px;border-bottom:1px solid var(--border);${isConflict?'background:repeating-linear-gradient(45deg,transparent,transparent 4px,rgba(248,113,113,.08) 4px,rgba(248,113,113,.08) 8px);':''}">`;
+      h+=`<div style="width:44px;flex-shrink:0;font-size:.72rem;color:var(--muted);padding-top:2px;text-align:right;padding-right:8px">${hrLabel}:00${isConflict?'<span style="color:var(--red);font-weight:700" title="Conflict"> !</span>':''}</div>`;
+      h+=`<div style="flex:1;position:relative;display:flex;gap:3px;padding:2px 0">`;
+      meetings.forEach(mtg=>{
+        const t=mtg.time||'';
+        const parts=t.split('-');if(parts.length<2) return;
+        const [sh,sm]=(parts[0]||'').split(':').map(Number);
+        const [eh,em]=(parts[1]||'').split(':').map(Number);
+        if(isNaN(sh)||isNaN(eh)) return;
+        if(sh>hr||eh<hr||(eh===hr&&em===0)) return;
+        const pc={'high':'rgba(248,113,113,.65)','medium':'rgba(250,204,21,.5)','low':'rgba(108,124,255,.4)'};
+        const bg=pc[mtg.priority]||'rgba(108,124,255,.35)';
+        const fullTitle = mtg.title || mtg.name || mtg.meeting || mtg.summary || '';
+        const shortTitle=(fullTitle||'').length>35?(fullTitle||'').slice(0,33)+'...':(fullTitle||'');
+        h+=`<div style="flex:1;background:${bg};border-radius:5px;padding:2px 8px;font-size:.7rem;font-weight:600;color:#fff;display:flex;align-items:center;overflow:hidden;white-space:nowrap;cursor:pointer" onclick="document.getElementById('mb-mtg-${meetings.indexOf(mtg)}')?.scrollIntoView({behavior:'smooth',block:'nearest'})" title="${escHtml(fullTitle||'')} (${t})">${sh===hr?escHtml(shortTitle):''}</div>`;
+      });
+      h+=`</div></div>`;
+    }
+    h+=`</div>`;
+    /* Expandable Meeting Prep Cards */
+    h+=`<div class="rv-section-title" style="margin-top:20px">Meeting Prep Cards</div>`;
+    meetings.forEach((mtg,mi)=>{
+      const pc={'high':'var(--red)','medium':'#facc15','low':'var(--accent)'};
+      const accentColor=pc[mtg.priority]||'var(--accent)';
       const attendees=mtg.attendees||[];
+      const actions=mtg.action_items||[];
+      const talkPts=mtg.talking_points||[];
+      const detId='mb-mtg-'+mi;
+      h+=`<div class="rv-card" id="${detId}" style="border-left:4px solid ${accentColor};cursor:pointer" onclick="var d=this.querySelector('.mb-mtg-detail');if(d){var o=d.style.display==='none';d.style.display=o?'block':'none';this.querySelector('.mb-mtg-arrow').textContent=o?'\\u25B2':'\\u25BC'}">`;
+      h+=`<div style="display:flex;align-items:center;gap:12px">`;
+      h+=`<div style="font-size:.82rem;font-weight:700;color:${accentColor};min-width:90px">${escHtml(mtg.time||'')}</div>`;
+      const mtgTitle = mtg.title || mtg.name || mtg.meeting || mtg.summary || '';
+      h+=`<div style="flex:1"><div class="rv-card-title" style="margin-bottom:0">${escHtml(mtgTitle)}</div></div>`;
+      h+=`<span class="rv-pill" style="background:${accentColor};color:#fff">${mtg.priority||''}</span>`;
+      h+=`<span style="font-size:.72rem;color:var(--muted)">${attendees.length?attendees.length+' attendees':'no attendees listed'}</span>`;
+      h+=`<span class="mb-mtg-arrow" style="color:var(--muted);font-size:.8rem">&#9660;</span>`;
+      h+=`</div>`;
+      h+=`<div class="mb-mtg-detail" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)" onclick="event.stopPropagation()">`;
+      if(mtg.context) h+=`<div style="margin-bottom:12px"><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">Context</div><div style="font-size:.86rem;line-height:1.55">${escHtml(mtg.context)}</div></div>`;
+      if(mtg.prior_notes) h+=`<div style="margin-bottom:12px"><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin-bottom:4px">Prior Notes</div><div style="font-size:.86rem;line-height:1.55">${escHtml(mtg.prior_notes)}</div></div>`;
+      if(talkPts.length) {
+        h+=`<div style="margin-bottom:12px"><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--green);margin-bottom:4px">Talking Points</div><ul style="margin:0 0 0 16px;font-size:.84rem">`;
+        talkPts.forEach(tp=>{h+=`<li style="margin-bottom:4px">${escHtml(tp)}</li>`;});
+        h+=`</ul></div>`;
+      }
+      if(actions.length) {
+        h+=`<div style="margin-bottom:12px"><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--red);margin-bottom:4px">Action Items to Drive</div><ul style="margin:0 0 0 16px;font-size:.84rem">`;
+        actions.forEach(a=>{h+=`<li style="margin-bottom:4px">${escHtml(a)}</li>`;});
+        h+=`</ul></div>`;
+      }
       if(attendees.length) {
-        h+=`<div class="rv-attendees">`;
+        h+=`<div><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">Attendees</div><div class="rv-attendees">`;
         attendees.forEach((att,ai)=>{
           const initials=(att.name||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
           const color=_avatarColors[ai%_avatarColors.length];
           const ooo=att.status&&att.status.toLowerCase().includes('ooo')?'rv-attendee-ooo':'';
-          h+=`<div class="rv-attendee ${ooo}">
-            <div class="rv-attendee-initial" style="background:${color}">${initials}</div>
-            <div><div style="font-weight:600">${escHtml(att.name||'')}</div>`;
+          h+=`<div class="rv-attendee ${ooo}"><div class="rv-attendee-initial" style="background:${color}">${initials}</div><div><div style="font-weight:600">${escHtml(att.name||'')}</div>`;
           if(att.role) h+=`<div style="font-size:.7rem;color:var(--muted)">${escHtml(att.role)}</div>`;
           if(att.last_interaction) h+=`<div style="font-size:.68rem;color:var(--muted)">${escHtml(att.last_interaction)}</div>`;
           if(att.status) h+=`<div style="font-size:.68rem;color:var(--red)">${escHtml(att.status)}</div>`;
           h+=`</div></div>`;
         });
-        h+=`</div>`;
+        h+=`</div></div>`;
       }
       h+=`</div></div>`;
     });
-    h+=`</div></div>`;
+    if(allDayItems.length) {
+      h+=`<div class="rv-section-title" style="margin-top:20px">All-Day Items</div>`;
+      allDayItems.forEach((ad,ai)=>{
+        const detId='mb-ad-'+ai;
+        h+=`<div class="rv-card" id="${detId}" style="border-left:4px solid var(--blue);cursor:pointer" onclick="var d=this.querySelector('.mb-mtg-detail');if(d){var o=d.style.display==='none';d.style.display=o?'block':'none';this.querySelector('.mb-mtg-arrow').textContent=o?'\\u25B2':'\\u25BC'}">`;
+        h+=`<div style="display:flex;align-items:center;gap:12px">`;
+        h+=`<div style="font-size:.82rem;font-weight:700;color:var(--blue);min-width:90px">All Day</div>`;
+        const adTitle = ad.title || ad.name || ad.meeting || ad.summary || '';
+        h+=`<div style="flex:1"><div class="rv-card-title" style="margin-bottom:0">${escHtml(adTitle)}</div></div>`;
+        h+=`<span class="rv-pill rv-pill-blue">all day</span>`;
+        h+=`<span class="mb-mtg-arrow" style="color:var(--muted);font-size:.8rem">&#9660;</span>`;
+        h+=`</div>`;
+        h+=`<div class="mb-mtg-detail" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)" onclick="event.stopPropagation()">`;
+        if(ad.context) h+=`<div style="margin-bottom:12px"><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px">Context</div><div style="font-size:.86rem;line-height:1.55">${escHtml(ad.context)}</div></div>`;
+        const talkPts=ad.talking_points||[];
+        if(talkPts.length) {
+          h+=`<div style="margin-bottom:12px"><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--green);margin-bottom:4px">Talking Points</div><ul style="margin:0 0 0 16px;font-size:.84rem">`;
+          talkPts.forEach(tp=>{h+=`<li style="margin-bottom:4px">${escHtml(tp)}</li>`;});
+          h+=`</ul></div>`;
+        }
+        const actions=ad.action_items||[];
+        if(actions.length) {
+          h+=`<div><div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--red);margin-bottom:4px">Action Items</div><ul style="margin:0 0 0 16px;font-size:.84rem">`;
+          actions.forEach(a=>{h+=`<li style="margin-bottom:4px">${escHtml(a)}</li>`;});
+          h+=`</ul></div>`;
+        }
+        h+=`</div></div>`;
+      });
+    }
+    h+=`</div>`;
   }
   const pe=data.priority_emails||[];
   if(pe.length) {
@@ -4128,14 +7570,23 @@ function renderMorningBrief(data) {
 /* ═══ Rich View: Commitment Tracker ═══ */
 function renderCommitmentTracker(data) {
   let h='';
-  h+=`<div class="rv-gauge-wrap">`;
-  h+=renderScoreBadge(data.health_score,'Health','ct-health-gauge');
-  h+=`<div style="flex:1"><div class="rv-metrics" style="margin-bottom:0">
-    <div class="rv-metric"><div class="rv-metric-value">${data.total_open||0}</div><div class="rv-metric-label">Open</div></div>
-    <div class="rv-metric"><div class="rv-metric-value" style="color:var(--red)">${data.total_overdue||0}</div><div class="rv-metric-label">Overdue</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${(data.others_owe_you||[]).length}</div><div class="rv-metric-label">Owed to You</div></div>
-    <div class="rv-metric"><div class="rv-metric-value" style="color:var(--green)">${(data.recently_completed||[]).length}</div><div class="rv-metric-label">Completed</div></div>
-  </div></div></div>`;
+
+  const biggestExposure = (data.analysis||{}).biggest_risk || '';
+  const ehData = data.executive_header || {
+    bluf: biggestExposure || `${data.total_open||0} open commitments, ${data.total_overdue||0} overdue`,
+    hero_image: data.hero_image || '',
+    status: (data.health_score||0) >= 70 ? 'green' : (data.health_score||0) >= 45 ? 'yellow' : 'red',
+    metrics: [
+      {label:'Health Score',value:data.health_score||0,color:(data.health_score||0)>=70?'green':(data.health_score||0)>=45?'yellow':'red'},
+      {label:'Open',value:data.total_open||0},
+      {label:'Overdue',value:data.total_overdue||0,color:(data.total_overdue||0)>0?'red':'green'},
+      {label:'Owed to You',value:(data.others_owe_you||[]).length}
+    ]
+  };
+  h += renderExecutiveHeader({...data, executive_header:ehData}, 'commitment-tracker');
+
+  h += renderStakeholderHeat(data.your_commitments || []);
+
   h+=renderAnalysisCard(data.analysis);
   const statusMap={'not_started':'Not Started','in_progress':'In Progress','blocked':'Blocked','completed':'Done','overdue':'Overdue','open':'In Progress','unverified':'Not Started'};
   const kanbanCols={'Not Started':[],'In Progress':[],'Blocked':[],'Done':[]};
@@ -4180,15 +7631,45 @@ function renderCommitmentTracker(data) {
 function renderProjectBrief(data) {
   let h='';
   const ps=data.portfolio_summary||{};
-  if(ps.total_projects) {
-    h+=`<div class="rv-metrics">
-      <div class="rv-metric"><div class="rv-metric-value">${ps.total_projects||0}</div><div class="rv-metric-label">Projects</div></div>
-      <div class="rv-metric"><div class="rv-metric-value" style="color:var(--green)">${ps.on_track||0}</div><div class="rv-metric-label">On Track</div></div>
-      <div class="rv-metric"><div class="rv-metric-value" style="color:#facc15">${ps.at_risk||0}</div><div class="rv-metric-label">At Risk</div></div>
-      <div class="rv-metric"><div class="rv-metric-value" style="color:var(--red)">${ps.blocked||0}</div><div class="rv-metric-label">Blocked</div></div>
-      <div class="rv-metric"><div class="rv-metric-value">${ps.avg_health||0}</div><div class="rv-metric-label">Avg Health</div></div>
-    </div>`;
+
+  const ehData = data.executive_header || {
+    bluf: (data.analysis||{}).executive_insight || '',
+    hero_image: data.hero_image || '',
+    status: (ps.blocked||0) > 0 ? 'red' : (ps.at_risk||0) > 0 ? 'yellow' : 'green',
+    metrics: [
+      {label:'Projects',value:ps.total_projects||0},
+      {label:'On Track',value:ps.on_track||0,color:'green'},
+      {label:'At Risk',value:ps.at_risk||0,color:(ps.at_risk||0)>0?'yellow':'green'},
+      {label:'Blocked',value:ps.blocked||0,color:(ps.blocked||0)>0?'red':'green'},
+      {label:'Avg Health',value:ps.avg_health||0}
+    ]
+  };
+  h += renderExecutiveHeader({...data, executive_header:ehData}, 'project-brief');
+
+  const decisions = [];
+  (data.projects||[]).forEach(proj => {
+    (proj.open_decisions||[]).forEach(d => {
+      if(typeof d === 'string') {
+        decisions.push({project: proj.name, decision: d, waiting_on: '', recommended_action: '', deadline: ''});
+      } else {
+        decisions.push({project: proj.name, decision: d.decision || d.title || '', waiting_on: d.waiting_on || '', recommended_action: d.recommended_action || '', deadline: d.deadline || ''});
+      }
+    });
+  });
+  if(decisions.length) {
+    h += '<div class="rv-section"><div class="rv-section-title" style="color:var(--red)">Decisions Needed (' + decisions.length + ')</div>';
+    decisions.forEach(d => {
+      h += `<div class="exec-decision-card">
+        <div class="exec-decision-title"><span style="font-size:1.1rem">&#9888;</span> ${escHtml(d.decision)}</div>
+        ${d.waiting_on ? '<div class="exec-decision-detail"><b>Waiting on:</b> ' + escHtml(d.waiting_on) + '</div>' : ''}
+        ${d.recommended_action ? '<div class="exec-decision-detail"><b>Action:</b> ' + escHtml(d.recommended_action) + '</div>' : ''}
+        ${d.deadline ? '<div class="exec-decision-detail" style="color:var(--red)"><b>Deadline:</b> ' + escHtml(d.deadline) + '</div>' : ''}
+        <div style="font-size:.72rem;color:var(--muted);margin-top:6px">Project: ${escHtml(d.project)}</div>
+      </div>`;
+    });
+    h += '</div>';
   }
+
   h+=renderAnalysisCard(data.analysis);
   const projects=data.projects||[];
   h+=`<div class="rv-filter-bar">`;
@@ -4253,54 +7734,103 @@ function renderFocusAudit(data) {
   h+=`<div class="rv-gauge-wrap">`;
   h+=renderScoreBadge(data.productivity_score,'Productivity','fa-prod-gauge');
   h+=`<div style="flex:1"><div class="rv-metrics" style="margin-bottom:0">
+    <div class="rv-metric"><div class="rv-metric-value">${m.total_active_hours!=null&&m.total_active_hours>=0?(m.total_active_hours).toFixed(1)+'h':'--'}</div><div class="rv-metric-label">Active Hours</div></div>
     <div class="rv-metric"><div class="rv-metric-value">${(m.deep_work_hours||0).toFixed(1)}h</div><div class="rv-metric-label">Deep Work</div></div>
     <div class="rv-metric"><div class="rv-metric-value">${(m.meeting_hours||0).toFixed(1)}h</div><div class="rv-metric-label">Meetings</div></div>
-    <div class="rv-metric"><div class="rv-metric-value">${m.context_switches||0}</div><div class="rv-metric-label">Context Switches</div></div>
+    <div class="rv-metric"><div class="rv-metric-value">${m.context_switches>=0?m.context_switches:'--'}</div><div class="rv-metric-label">Context Switches</div></div>
     <div class="rv-metric"><div class="rv-metric-value">${m.longest_focus_block_minutes||0}m</div><div class="rv-metric-label">Best Focus Block</div></div>
     <div class="rv-metric"><div class="rv-metric-value">${(m.meeting_load_percent||0).toFixed(0)}%</div><div class="rv-metric-label">Meeting Load</div></div>
   </div></div></div>`;
+  if(data.focus_villain) h+=`<div class="rv-card rv-severity-high" style="margin-bottom:20px"><div class="rv-card-title" style="font-size:1rem">Focus Villain</div><div class="rv-card-body">${escHtml(data.focus_villain)}</div></div>`;
   h+=renderAnalysisCard(data.analysis);
-  if(data.focus_villain) h+=`<div class="rv-card rv-severity-high" style="margin-bottom:24px"><div class="rv-card-title" style="font-size:1rem">Focus Villain: ${escHtml(data.focus_villain)}</div><div class="rv-card-body">This app or pattern interrupts your focus the most. Consider batching or blocking it during deep work windows.</div></div>`;
   const comp=data.comparison||{};
-  if(comp.vs_7d_avg) {
-    const deltaColor=comp.vs_7d_avg==='better'?'var(--green)':comp.vs_7d_avg==='worse'?'var(--red)':'var(--muted)';
-    const arrow=comp.vs_7d_avg==='better'?'&#9650;':comp.vs_7d_avg==='worse'?'&#9660;':'&#9644;';
-    h+=`<div class="rv-metrics"><div class="rv-metric"><div class="rv-metric-value" style="color:${deltaColor}">${arrow}</div><div class="rv-metric-label">vs 7-day avg: ${comp.vs_7d_avg}</div></div>`;
-    if(comp.deep_work_delta!=null) h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${comp.deep_work_delta>=0?'var(--green)':'var(--red)'}">${comp.deep_work_delta>=0?'+':''}${comp.deep_work_delta.toFixed(1)}h</div><div class="rv-metric-label">Deep Work Delta</div></div>`;
-    if(comp.meeting_delta!=null) h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${comp.meeting_delta<=0?'var(--green)':'var(--red)'}">${comp.meeting_delta>=0?'+':''}${comp.meeting_delta.toFixed(1)}h</div><div class="rv-metric-label">Meeting Delta</div></div>`;
+  if(comp.vs_7d_avg&&comp.vs_7d_avg!=='same') {
+    const deltaColor=comp.vs_7d_avg==='better'?'var(--green)':'var(--red)';
+    const arrow=comp.vs_7d_avg==='better'?'&#9650;':'&#9660;';
+    h+=`<div class="rv-metrics">`;
+    h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${deltaColor}">${arrow} ${comp.vs_7d_avg}</div><div class="rv-metric-label">vs 7-Day Avg</div></div>`;
+    if(comp.deep_work_delta&&comp.deep_work_delta!==0) h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${comp.deep_work_delta>=0?'var(--green)':'var(--red)'}">${comp.deep_work_delta>=0?'+':''}${comp.deep_work_delta.toFixed(1)}h</div><div class="rv-metric-label">Deep Work</div></div>`;
+    if(comp.meeting_delta&&comp.meeting_delta!==0) h+=`<div class="rv-metric"><div class="rv-metric-value" style="color:${comp.meeting_delta<=0?'var(--green)':'var(--red)'}">${comp.meeting_delta>=0?'+':''}${comp.meeting_delta.toFixed(1)}h</div><div class="rv-metric-label">Meetings</div></div>`;
     h+=`</div>`;
   }
+  /* Day Timeline - visual calendar showing how the day was spent */
+  const hb=data.hourly_breakdown||[];
+  if(hb.length) {
+    const catColor={'deep_work':'rgba(74,222,128,.7)','meeting':'rgba(248,113,113,.7)','communication':'rgba(250,204,21,.7)','research':'rgba(108,124,255,.7)','admin':'rgba(128,128,128,.5)'};
+    const catLabel={'deep_work':'Deep Work','meeting':'Meeting','communication':'Comms','research':'Research','admin':'Admin'};
+    const hours=new Map();
+    hb.forEach(b=>{const hr=b.hour||'';if(!hours.has(hr))hours.set(hr,[]);hours.get(hr).push(b);});
+    h+=`<div class="rv-section"><div class="rv-section-title">Day Timeline</div>`;
+    h+=`<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">`;
+    Object.entries(catColor).forEach(([k,c])=>{h+=`<span style="font-size:.72rem;color:var(--muted);display:flex;align-items:center;gap:4px"><span style="width:12px;height:12px;border-radius:3px;background:${c};display:inline-block"></span>${catLabel[k]||k}</span>`;});
+    h+=`</div>`;
+    [...hours.entries()].sort((a,b)=>a[0].localeCompare(b[0])).forEach(([hr,items])=>{
+      h+=`<div style="display:flex;align-items:stretch;margin-bottom:4px;min-height:36px">`;
+      h+=`<div style="width:50px;flex-shrink:0;font-size:.76rem;color:var(--muted);display:flex;align-items:center;justify-content:flex-end;padding-right:10px">${escHtml(hr)}</div>`;
+      h+=`<div style="flex:1;display:flex;gap:3px">`;
+      items.forEach(b=>{
+        const cat=(b.category||'admin').toLowerCase().replace(/[^a-z_]/g,'');
+        const bg=catColor[cat]||'rgba(128,128,128,.4)';
+        const appShort=(b.app||'').split('—')[0].split('–')[0].trim().replace(/^(Microsoft |Calendar\/)/,'');
+        h+=`<div style="flex:1;background:${bg};border-radius:6px;padding:4px 8px;font-size:.72rem;font-weight:600;color:#fff;display:flex;align-items:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(b.app||'')}">${escHtml(appShort)}</div>`;
+      });
+      h+=`</div></div>`;
+    });
+    h+=`</div>`;
+  }
+  /* Heatmap */
   const hm=data.hourly_heatmap||[];
   if(hm.length) {
-    h+=`<div class="rv-section"><div class="rv-section-title">Hourly Productivity Heatmap</div><div class="rv-heatmap" style="grid-template-columns:repeat(${Math.min(hm.length,13)},1fr)">`;
+    h+=`<div class="rv-section"><div class="rv-section-title">Hourly Productivity Score</div><div class="rv-heatmap" style="grid-template-columns:repeat(${Math.min(hm.length,13)},1fr)">`;
     hm.forEach(cell=>{
       const s=cell.score||0;
       const bg=s>=75?'rgba(74,222,128,.6)':s>=50?'rgba(250,204,21,.5)':s>=25?'rgba(248,113,113,.4)':'rgba(128,128,128,.2)';
-      h+=`<div class="rv-heatmap-cell" style="background:${bg}" title="${cell.hour}: ${cell.dominant_activity||''} (${s}/100)">${escHtml(cell.hour||'').replace(':00','')}</div>`;
+      h+=`<div class="rv-heatmap-cell" style="background:${bg}" title="${cell.hour}: ${cell.dominant_activity||''} (${s}/100)"><div style="font-size:.7rem">${escHtml(cell.hour||'').replace(':00','')}</div><div style="font-size:.62rem;opacity:.8">${s}</div></div>`;
     });
     h+=`</div></div>`;
   }
-  h+=`<div class="rv-cols">`;
-  h+=`<div class="rv-chart-container"><div class="rv-section-title">App Usage</div><canvas id="fa-app-chart"></canvas></div>`;
-  const ab=data.app_breakdown||[];
-  if(ab.length) {
-    h+=`<div class="rv-section"><div class="rv-section-title">App Breakdown</div>`;
-    const catColors={'deep_work':'rgba(74,222,128,.5)','meeting':'rgba(248,113,113,.5)','communication':'rgba(250,204,21,.5)','research':'rgba(108,124,255,.5)','admin':'rgba(128,128,128,.4)'};
-    const maxMin=Math.max(...ab.map(a=>a.minutes||0),1);
-    h+=`<div class="rv-treemap" style="grid-template-columns:${ab.map(a=>`${Math.max(1,Math.round((a.minutes||0)/maxMin*3))}fr`).join(' ')}">`;
-    ab.forEach((a,i)=>{
-      const bg=catColors[a.category]||_avatarColors[i%_avatarColors.length];
-      h+=`<div class="rv-treemap-cell" style="background:${bg}"><div class="rv-treemap-name">${escHtml(a.name||'')}</div><div class="rv-treemap-val">${Math.round(a.minutes||0)}m (${(a.percent||0).toFixed(0)}%)</div></div>`;
+  /* App breakdown - filter out -1 values */
+  const abRaw=data.app_breakdown||[];
+  const ab=abRaw.filter(a=>(a.minutes||0)>0);
+  const taRaw=data.top_apps||[];
+  const ta=taRaw.filter(a=>(a.hours||0)>0);
+  const appData=ab.length?ab:ta.map(a=>({name:a.name,minutes:Math.round((a.hours||0)*60),percent:0,category:a.category}));
+  if(appData.length) {
+    const total=appData.reduce((s,a)=>s+(a.minutes||0),0)||1;
+    h+=`<div class="rv-cols">`;
+    h+=`<div class="rv-chart-container"><div class="rv-section-title">App Usage</div><canvas id="fa-app-chart"></canvas></div>`;
+    h+=`<div class="rv-section"><div class="rv-section-title">Time by App</div>`;
+    appData.sort((a,b)=>(b.minutes||0)-(a.minutes||0));
+    appData.forEach((a,i)=>{
+      const pct=Math.round(((a.minutes||0)/total)*100);
+      const color=_avatarColors[i%_avatarColors.length];
+      h+=`<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;font-size:.82rem;margin-bottom:3px"><span style="font-weight:600">${escHtml(a.name||'')}</span><span style="color:var(--muted)">${a.minutes||0}m (${pct}%)</span></div>`;
+      h+=`<div class="rv-progress"><div class="rv-progress-bar" style="width:${pct}%;background:${color}"></div></div></div>`;
     });
     h+=`</div></div>`;
   }
-  h+=`</div>`;
+  /* Focus windows */
   const fw=data.focus_windows||[];
   if(fw.length){h+=`<div class="rv-section"><div class="rv-section-title">Best Focus Windows</div>`;fw.forEach(f=>{h+=`<div class="rv-card" style="border-left:3px solid var(--green)"><div class="rv-card-title">${escHtml(f.start||'')} — ${f.duration_minutes||0} min</div><div class="rv-card-body">${escHtml(f.context||'')}</div><div class="rv-card-meta">${escHtml(f.app||'')}</div></div>`;});h+=`</div>`;}
+  /* Fragmentation */
   const fh=data.fragmentation_hotspots||[];
-  if(fh.length){h+=`<div class="rv-section"><div class="rv-section-title">Fragmentation Hotspots</div>`;fh.forEach(f=>{h+=`<div class="rv-card rv-severity-warning"><div class="rv-card-title">${escHtml(f.hour||'')} — ${f.switches||0} switches</div><div class="rv-card-body">${escHtml(f.detail||'')}</div></div>`;});h+=`</div>`;}
+  if(fh.length){h+=`<div class="rv-section"><div class="rv-section-title">Fragmentation Hotspots</div>`;fh.forEach(f=>{h+=`<div class="rv-card rv-severity-warning"><div class="rv-card-title">${escHtml(f.hour||'')}${f.switches>=0?' — '+f.switches+' switches':''}</div><div class="rv-card-body">${escHtml(f.detail||'')}</div></div>`;});h+=`</div>`;}
+  /* Optimization plan with gain bars */
   const opt=data.optimization_plan||[];
-  if(opt.length){h+=`<div class="rv-section"><div class="rv-section-title">Optimization Plan</div>`;opt.forEach(o=>{const dc={'easy':'rv-pill-green','medium':'rv-pill-yellow','hard':'rv-pill-red'};h+=`<div class="rv-card"><div class="rv-card-title">${escHtml(o.suggestion||'')}</div><div class="rv-card-meta"><span class="rv-pill ${dc[o.difficulty]||'rv-pill-gray'}">${o.difficulty||''}</span> Expected gain: +${o.expected_gain_minutes||0} min</div></div>`;});h+=`</div>`;}
+  if(opt.length){
+    opt.sort((a,b)=>(b.expected_gain_minutes||0)-(a.expected_gain_minutes||0));
+    const maxGain=Math.max(...opt.map(o=>o.expected_gain_minutes||0),1);
+    h+=`<div class="rv-section"><div class="rv-section-title">Optimization Plan</div>`;
+    opt.forEach(o=>{
+      const dc={'easy':'rv-pill-green','medium':'rv-pill-yellow','hard':'rv-pill-red'};
+      const barPct=Math.round(((o.expected_gain_minutes||0)/maxGain)*100);
+      h+=`<div class="rv-card"><div class="rv-card-title" style="display:flex;align-items:center;gap:8px"><span class="rv-pill ${dc[o.difficulty]||'rv-pill-gray'}">${o.difficulty||''}</span> +${o.expected_gain_minutes||0} min</div>`;
+      h+=`<div class="rv-progress" style="margin:8px 0"><div class="rv-progress-bar rv-progress-bar-green" style="width:${barPct}%"></div></div>`;
+      h+=`<div class="rv-card-body">${escHtml(o.suggestion||'')}</div></div>`;
+    });
+    h+=`</div>`;
+  }
+  /* Insights */
   const ins=[...(data.insights||[]),...(data.recommendations||[])];
   if(ins.length){h+=`<div class="rv-section"><div class="rv-section-title">Insights & Recommendations</div><ul style="margin:0 0 0 16px;font-size:.88rem">`;ins.forEach(i=>{h+=`<li style="margin-bottom:8px">${escHtml(i)}</li>`;});h+=`</ul></div>`;}
   return h;
@@ -4358,7 +7888,7 @@ function renderRelationshipCrm(data) {
         <div class="rv-card-body"><span style="color:var(--accent)">${stars}</span> <span class="rv-pill" style="background:${tc};color:#fff;font-size:.65rem">${c.trend||''}</span> <span style="color:${vcol};font-size:.8rem">${vc}</span>`;
       if(c.health_score!=null) ch+=` <span style="font-size:.72rem;color:var(--muted)">Health: ${c.health_score}/100</span>`;
       ch+=`<br><span style="font-size:.8rem;color:var(--muted)">Topics: ${escHtml((c.primary_topics||[]).join(', '))}</span></div>
-        <div class="rv-card-meta">${c.interactions_7d||0} this week &middot; ${c.interactions_30d||0} this month &middot; Last: ${escHtml(c.last_interaction||'')}</div></div></div>`;
+        <div class="rv-card-meta">${(c.channels||[]).map(ch2=>{const cc={'Email':'#6c7cff','Meeting':'#4ade80','Teams Chat':'#a855f7','Teams Meeting':'#a855f7','Teams Call':'#a855f7','Audio':'#f59e0b'}[ch2]||'#6b7280';return `<span style="display:inline-block;padding:1px 6px;border-radius:8px;font-size:.65rem;background:${cc};color:#fff;margin-right:3px">${escHtml(ch2)}</span>`}).join('')} ${c.interactions_7d||0} this week &middot; ${c.interactions_30d||0} this month &middot; Last: ${escHtml(c.last_interaction||'')}</div></div></div>`;
     });
     ch+=`</div>`;
     return ch;
@@ -4683,6 +8213,63 @@ async function togglePrivacy() {
   try { const d=await(await fetch('/api/privacy/toggle',{method:'POST'})).json(); renderPrivacy(d); setTimeout(refresh,1000); }
   catch(e){ btn.textContent='Error'; }
   btn.disabled=false;
+}
+
+/* ═══ Audio Device Picker ═══ */
+async function loadAudioDevices() {
+  const sel = document.getElementById('audio-device-select');
+  sel.disabled = true;
+  sel.innerHTML = '<option value="">Loading...</option>';
+  try {
+    const d = await(await fetch('/api/audio/devices')).json();
+    if (d.error) {
+      sel.innerHTML = '<option value="">Screenpipe unavailable</option>';
+      return;
+    }
+    const devices = d.devices || [];
+    if (!devices.length) {
+      sel.innerHTML = '<option value="">No devices found</option>';
+      return;
+    }
+    sel.innerHTML = '';
+    devices.forEach(dev => {
+      const opt = document.createElement('option');
+      opt.value = dev.name;
+      opt.textContent = dev.name;
+      if (d.preferred && dev.name === d.preferred) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.disabled = false;
+  } catch(e) {
+    sel.innerHTML = '<option value="">Error loading devices</option>';
+  }
+}
+async function switchAudioDevice(name) {
+  if (!name) return;
+  const sel = document.getElementById('audio-device-select');
+  const msg = document.getElementById('audio-device-msg');
+  sel.disabled = true;
+  msg.textContent = 'Switching...';
+  msg.style.color = 'var(--muted)';
+  try {
+    const d = await(await fetch('/api/audio/device', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({device_name: name})
+    })).json();
+    if (d.error) {
+      msg.textContent = d.error;
+      msg.style.color = 'var(--red)';
+    } else {
+      msg.textContent = 'Switched!';
+      msg.style.color = 'var(--green)';
+    }
+  } catch(e) {
+    msg.textContent = 'Failed';
+    msg.style.color = 'var(--red)';
+  }
+  sel.disabled = false;
+  setTimeout(() => { msg.textContent = ''; }, 3000);
 }
 
 /* ═══ Sync ═══ */
@@ -5103,9 +8690,11 @@ function chatSend() {
   chatWs.send(JSON.stringify({type: 'message', content: text}));
 }
 
-document.getElementById('chat-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSend(); }
-});
+if (document.getElementById('chat-input')) {
+  document.getElementById('chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSend(); }
+  });
+}
 
 function _chatArgsSummary(args) {
   if (!args) return '';
@@ -5136,10 +8725,12 @@ function _chatMd(text) {
 }
 
 /* ═══ Init ═══ */
-refresh(); loadSync(); loadPipeline(); loadSkills(); loadAgentStatus();
-setInterval(refresh, R);
-setInterval(loadSync, 60000);
-browseTo('');
+if (document.getElementById('cards')) {
+  refresh(); loadSync(); loadPipeline(); loadSkills(); loadAgentStatus(); loadAudioDevices();
+  setInterval(refresh, R);
+  setInterval(loadSync, 60000);
+  browseTo('');
+}
 </script>
 </body>
 </html>"""
@@ -5148,6 +8739,34 @@ browseTo('');
 # ── WebSocket chat endpoint ──────────────────────────────────────────────────
 
 _agent_sessions: dict[str, Any] = {}
+_session_last_active: dict[str, float] = {}
+_SESSION_IDLE_TIMEOUT = 600  # 10 minutes
+
+
+async def _prune_idle_sessions() -> None:
+    """Remove WebSocket sessions idle longer than timeout."""
+    now = time.time()
+    stale = [
+        sid for sid, ts in _session_last_active.items()
+        if (now - ts) > _SESSION_IDLE_TIMEOUT
+    ]
+    for sid in stale:
+        _agent_sessions.pop(sid, None)
+        _session_last_active.pop(sid, None)
+        logger.info("Pruned idle chat session: %s", sid)
+
+
+@app.on_event("startup")
+async def _start_session_cleanup() -> None:
+    async def _cleanup_loop() -> None:
+        while True:
+            await asyncio.sleep(120)
+            try:
+                await _prune_idle_sessions()
+                await _prune_chat_sessions()
+            except Exception:
+                logger.exception("Session cleanup error")
+    asyncio.create_task(_cleanup_loop())
 
 
 @app.websocket("/ws/chat")
@@ -5161,12 +8780,14 @@ async def ws_chat(websocket: WebSocket) -> None:
     if session_id not in _agent_sessions:
         _load_env_local()
         _agent_sessions[session_id] = AgentSession(_cfg())
+    _session_last_active[session_id] = time.time()
 
     session = _agent_sessions[session_id]
 
     try:
         while True:
             data = await websocket.receive_json()
+            _session_last_active[session_id] = time.time()
             msg_type = data.get("type", "")
             content = data.get("content", "").strip()
 
@@ -5182,9 +8803,11 @@ async def ws_chat(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "content": str(exc)})
     except WebSocketDisconnect:
         _agent_sessions.pop(session_id, None)
+        _session_last_active.pop(session_id, None)
         logger.info("Chat WebSocket disconnected: %s", session_id)
     except Exception:
         _agent_sessions.pop(session_id, None)
+        _session_last_active.pop(session_id, None)
         logger.exception("Chat WebSocket unexpected error")
 
 
@@ -5201,8 +8824,17 @@ async def report_page(skill_name: str, date: str) -> HTMLResponse:
         "weekly-status": "Weekly Status",
         "plan-my-week": "Plan My Week",
         "morning-brief": "Morning Brief",
+        "commitment-tracker": "Commitment Tracker",
+        "project-brief": "Project Brief",
+        "focus-audit": "Focus & Time Audit",
+        "relationship-crm": "Relationship Intelligence",
+        "team-manager": "Team Manager",
+        "approvals-queue": "Approvals Queue",
+        "strategic-radar": "Strategic Radar",
+        "decision-log": "Decision Log",
+        "executive-package": "Executive Package",
     }
-    display_title = title_map.get(skill_name, skill_name)
+    display_title = title_map.get(skill_name, skill_name.replace("-", " ").title())
 
     cfg = _cfg()
     vault = Path(cfg.get("obsidian_vault", "")).expanduser()
@@ -5213,11 +8845,37 @@ async def report_page(skill_name: str, date: str) -> HTMLResponse:
     report_json = "null"
     md_content = ""
     if json_path.is_file():
-        report_json = json_path.read_text(encoding="utf-8", errors="replace")
+        raw_json = json_path.read_text(encoding="utf-8", errors="replace")
+        if skill_name in ("plan-my-week", "weekly-status"):
+            try:
+                enriched = json.loads(raw_json)
+                if skill_name == "plan-my-week":
+                    _enrich_plan_with_actuals(enriched, vault, cfg)
+                else:
+                    _enrich_weekly_status_with_actuals(enriched, vault, cfg)
+                report_json = json.dumps(enriched)
+            except Exception:
+                report_json = raw_json
+        else:
+            report_json = raw_json
     elif md_path.is_file():
         md_content = md_path.read_text(encoding="utf-8", errors="replace")
-
-    import re
+        embedded = extract_embedded_json(md_content)
+        if embedded:
+            normalized = normalize_report(skill_name, embedded, markdown=md_content)
+            if skill_name in ("plan-my-week", "weekly-status"):
+                try:
+                    if skill_name == "plan-my-week":
+                        _enrich_plan_with_actuals(normalized, vault, cfg)
+                    else:
+                        _enrich_weekly_status_with_actuals(normalized, vault, cfg)
+                except Exception:
+                    pass
+            report_json = json.dumps(normalized)
+        elif skill_name == "project-brief":
+            parsed = parse_project_brief_markdown(md_content)
+            if parsed:
+                report_json = json.dumps(parsed)
     css_match = re.search(r"(<style>.*?</style>)", DASHBOARD_HTML, re.DOTALL)
     css_block = css_match.group(1) if css_match else ""
     js_match = re.search(r"(<script>.*?</script>)", DASHBOARD_HTML, re.DOTALL)
@@ -5231,27 +8889,66 @@ async def report_page(skill_name: str, date: str) -> HTMLResponse:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{display_title} &mdash; {date}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 {css_block}
 <style>
-  body {{ background: var(--bg); color: var(--text); margin: 0; padding: 0; }}
+  body {{
+    background: var(--bg); color: var(--text); margin: 0; padding: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
+  }}
   .report-header {{
     display: flex; align-items: center; gap: 16px;
-    padding: 18px 28px; border-bottom: 1px solid var(--border);
-    background: var(--surface);
+    padding: 20px 32px; background: #1E1B4B; color: #fff;
   }}
-  .report-header h1 {{ font-size: 1.3rem; font-weight: 700; margin: 0; }}
-  .report-header .date {{ font-size: .88rem; color: var(--muted); }}
-  .report-body {{ padding: 28px; max-width: 1400px; margin: 0 auto; }}
+  .report-header h1 {{ font-size: 1.4rem; font-weight: 700; margin: 0; letter-spacing: -0.3px; color: #fff; }}
+  .report-header .date {{ font-size: .88rem; color: rgba(255,255,255,0.7); }}
+  .report-body {{ padding: 32px; max-width: 1100px; margin: 0 auto; }}
+  .report-actions {{
+    display: flex; gap: 8px; margin-left: auto;
+  }}
+  .pdf-btn {{
+    background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 8px; padding: 8px 18px; font-size: .82rem; font-weight: 600;
+    cursor: pointer; transition: all .15s;
+  }}
+  .pdf-btn:hover {{ background: rgba(255,255,255,0.25); }}
+  .theme-toggle {{
+    background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.7); border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px; padding: 8px 14px; font-size: .82rem; cursor: pointer; transition: all .15s;
+  }}
+  .theme-toggle:hover {{ background: rgba(255,255,255,0.2); color: #fff; }}
 </style>
 </head>
 <body>
 <div class="report-header">
   <h1>{display_title}</h1>
   <span class="date">{date}</span>
+  <div class="report-actions">
+    <button class="theme-toggle" onclick="toggleReportTheme()">Light Mode</button>
+    <button class="pdf-btn" onclick="downloadPDF()">Download PDF</button>
+  </div>
 </div>
 <div class="report-body" id="report-body"></div>
+<div class="report-footer-print">
+  <span>MemoryOS &middot; {display_title}</span>
+  <span>{date}</span>
+</div>
 {js_block}
 <script>
+function toggleReportTheme() {{
+  const html = document.documentElement;
+  const btn = document.querySelector('.theme-toggle');
+  if (html.classList.contains('exec-light')) {{
+    html.classList.remove('exec-light');
+    btn.textContent = 'Light Mode';
+  }} else {{
+    html.classList.add('exec-light');
+    btn.textContent = 'Dark Mode';
+  }}
+}}
 (function() {{
   const name = {json.dumps(skill_name)};
   const date = {json.dumps(date)};
@@ -5259,9 +8956,9 @@ async def report_page(skill_name: str, date: str) -> HTMLResponse:
   const data = {report_json};
   const mdContent = {escaped_md};
   if (data) {{
-    const rendererMap = {{'news-pulse':renderNewsPulse,'weekly-status':renderWeeklyStatus,'plan-my-week':renderPlanMyWeek,'morning-brief':renderMorningBrief,'commitment-tracker':renderCommitmentTracker,'project-brief':renderProjectBrief,'focus-audit':renderFocusAudit,'relationship-crm':renderRelationshipCrm,'team-manager':renderTeamManager}};
+    const rendererMap = {{'news-pulse':renderNewsPulse,'weekly-status':renderWeeklyStatus,'plan-my-week':renderPlanMyWeek,'morning-brief':renderMorningBrief,'commitment-tracker':renderCommitmentTracker,'project-brief':renderProjectBrief,'focus-audit':renderFocusAudit,'relationship-crm':renderRelationshipCrm,'team-manager':renderTeamManager,'approvals-queue':renderApprovalsQueue}};
     const renderFn = rendererMap[name];
-    if (renderFn) {{ body.innerHTML = renderFn(data, name, date); if (name === 'weekly-status') setTimeout(()=>initWeeklyStatusCharts(data), 100); }}
+    if (renderFn) {{ body.innerHTML = renderFn(data, name, date); setTimeout(()=>_initRichViewCharts(name, data), 100); }}
     else body.innerHTML = '<p>Rich view not available.</p>';
   }} else if (mdContent) {{
     body.innerHTML = renderMarkdown(mdContent);

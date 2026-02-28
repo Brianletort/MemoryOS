@@ -1,8 +1,0 @@
-{
-  "consecutive_no_data": 0,
-  "consecutive_degraded": 0,
-  "last_restart_epoch": 1771930240.538749,
-  "consecutive_no_audio": 0,
-  "last_audio_cycle_epoch": 1771965732.196821,
-  "last_restart_reason": "DB stale for 31m, 13 cycles with no data"
-}

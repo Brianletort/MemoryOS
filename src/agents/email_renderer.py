@@ -794,6 +794,24 @@ def render_project_brief_email(json_data: dict[str, Any], images_dir: Path) -> s
                 bh += _card(_esc(b.get("title", "")), body=_esc(b.get("impact", "")), accent_left=_severity_color(b.get("severity", "medium")))
             body += _section("Blockers & Risks", bh)
 
+        decisions = proj.get("open_decisions", [])
+        if decisions:
+            dh = ""
+            for d in decisions:
+                if isinstance(d, str):
+                    dh += _card(_esc(d), accent_left=_C["orange"])
+                else:
+                    detail_parts = []
+                    if d.get("waiting_on"):
+                        detail_parts.append(f'<b>Waiting on:</b> {_esc(d["waiting_on"])}')
+                    if d.get("recommended_action"):
+                        detail_parts.append(f'<b>Action:</b> {_esc(d["recommended_action"])}')
+                    if d.get("deadline"):
+                        detail_parts.append(f'<b>Deadline:</b> {_esc(d["deadline"])}')
+                    meta = "<br>".join(detail_parts)
+                    dh += _card(_esc(d.get("decision", "")), meta=meta, accent_left=_C["orange"])
+            body += _section("Decisions Needed", dh)
+
         steps = proj.get("next_steps", [])
         if steps:
             items = "".join(f'<li style="margin-bottom:6px;">{_esc(s)}</li>' for s in steps)

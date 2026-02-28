@@ -93,6 +93,19 @@ The Setup Wizard walks you through:
 
 After the wizard completes, MemoryOS runs automatically in the background. Data starts flowing into your vault within minutes.
 
+### Chat Frontend
+
+The installer sets up the chat frontend as a launchd service. To run it manually for development:
+
+```bash
+cd frontend
+cp .env.example .env.local
+npm install
+npm run dev
+```
+
+The chat UI will be available at `http://localhost:3000`.
+
 ### macOS Permissions
 
 After setup, grant Full Disk Access to Python so email and calendar extraction runs without popups:
@@ -152,6 +165,31 @@ The web dashboard provides monitoring and control at `http://localhost:8765`:
 - **Skills**: installed Cursor agent skills
 
 The dashboard runs automatically via launchd. To start manually: `python3 src/dashboard/app.py`
+
+## Chat Interface
+
+MemoryOS includes a full-stack chat interface that connects directly to your memory vault. It runs as a Next.js app at `http://localhost:3000` backed by the FastAPI server at `http://localhost:8765`.
+
+- **Persistent sessions** -- conversations are saved to SQLite and exported as Markdown into your Obsidian vault (`95_chat/`)
+- **Streaming responses** -- real-time SSE streaming with visible tool execution trace
+- **Auto-RAG** -- the agent automatically searches your vault, emails, meetings, and activity to answer questions
+- **File upload** -- drag-and-drop files (PDF, DOCX, PPTX, XLSX, CSV) with automatic text extraction
+- **PowerPoint generation** -- build slide decks from natural language descriptions
+- **Model selection** -- choose between default, thinking (high reasoning), and pro models
+- **Web search** -- toggle live web search for questions that need current information
+
+### Running the Chat UI
+
+The chat frontend runs automatically via launchd after setup. For development:
+
+```bash
+cd frontend
+cp .env.example .env.local    # API URL defaults to http://localhost:8765
+npm install
+npm run dev                    # http://localhost:3000
+```
+
+Make sure the backend is running (`python3 src/dashboard/app.py` or via launchd).
 
 ## System Monitoring
 
@@ -248,6 +286,10 @@ After activation, these launchd agents run automatically:
 | `com.memoryos.weekly-status` | Weekly | AI weekly status report |
 | `com.memoryos.commitment-tracker` | Scheduled | Track action items and follow-ups |
 | `com.memoryos.news-pulse` | Scheduled | Curated industry news briefing |
+| `com.memoryos.chat-frontend` | Continuous | Next.js chat UI on port 3000 |
+| `com.memoryos.activity-summarizer` | 30 min | LLM-powered screen activity summaries |
+| `com.memoryos.resource-monitor` | 5 min | System resource monitoring |
+| `com.memoryos.approvals-queue` | 15 min | Pending approvals tracker |
 
 ### Running Extractors Manually
 
@@ -307,6 +349,13 @@ Filtered audio is never deleted -- it goes into a collapsible `<details>` sectio
 | `GET /api/file?path=` | Preview a vault Markdown file |
 | `POST /api/run/{extractor}` | Manually trigger an extractor run |
 | `POST /api/agent/{name}/{action}` | Control launchd agents (start/stop/restart) |
+| `GET /api/sessions` | List chat sessions |
+| `POST /api/sessions` | Create a new chat session |
+| `GET /api/sessions/{id}` | Get session with message history |
+| `POST /api/chat` | SSE streaming chat (agent loop with auto-RAG) |
+| `POST /api/files/upload` | Upload file with automatic text extraction |
+| `GET /api/files/download/{name}` | Download a generated or uploaded file |
+| `POST /api/pptx/build` | Build a PowerPoint deck from a JSON spec |
 
 </details>
 
@@ -412,7 +461,8 @@ MemoryOS/
 │   │   ├── outlook_extractor.py       # Outlook Classic SQLite DB
 │   │   ├── mail_app_extractor.py      # Mail.app via AppleScript
 │   │   ├── calendar_app_extractor.py  # Calendar.app via AppleScript
-│   │   └── onedrive_extractor.py      # Document conversion
+│   │   ├── onedrive_extractor.py      # Document conversion
+│   │   └── activity_summarizer.py     # LLM-powered activity summaries
 │   ├── common/                   # Shared utilities
 │   │   ├── config.py             # Config loader with env var overrides
 │   │   ├── state.py              # Cursor state management (atomic writes)
@@ -429,10 +479,29 @@ MemoryOS/
 │   │   ├── agent_loop.py         # Agentic chat with auto-RAG + tool loop
 │   │   ├── tools.py              # Agent tools (search, vault, email, web)
 │   │   └── llm_provider.py       # LLM abstraction (OpenAI, Anthropic, etc.)
+│   ├── chat/                     # Chat system
+│   │   ├── routes.py             # FastAPI chat endpoints (SSE streaming)
+│   │   ├── store.py              # SQLite session/message persistence + Obsidian export
+│   │   ├── file_handler.py       # File upload with text extraction
+│   │   └── pptx_builder.py       # PowerPoint generation from chat
+│   ├── analyzers/                # Data analysis modules
+│   │   └── activity_summarizer.py # Screen activity pattern analysis
 │   ├── monitor/                  # System health monitoring
-│   │   └── watchdog.py           # Component health checks + macOS notifications
+│   │   ├── watchdog.py           # Component health checks + macOS notifications
+│   │   ├── resource_monitor.py   # System resource monitoring
+│   │   └── approvals_monitor.py  # Pending approvals tracker
 │   └── dashboard/
-│       └── app.py                # FastAPI web dashboard + Setup Wizard
+│       ├── app.py                # FastAPI web dashboard + Setup Wizard
+│       └── report_fallback.py    # Fallback report generation
+├── frontend/                     # Next.js chat application
+│   ├── src/
+│   │   ├── app/                  # App Router pages
+│   │   ├── components/           # React components (chat, dashboard, skills)
+│   │   ├── lib/                  # API client, hooks, utilities
+│   │   └── stores/               # Zustand state management
+│   ├── package.json              # Node.js dependencies
+│   └── .env.example              # Frontend environment template
+├── tests/                        # Test suite
 ├── scripts/
 │   ├── memoryos                  # CLI: start, stop, status, doctor, update
 │   ├── setup.sh                  # Developer setup (lightweight, no system deps)

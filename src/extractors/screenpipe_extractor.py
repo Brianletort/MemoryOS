@@ -639,7 +639,7 @@ import time as _time
 import urllib.request as _urllib_request
 
 _HEAL_STATE_FILE = Path(__file__).resolve().parent.parent.parent / "config" / "heal_screenpipe.json"
-SCREENPIPE_STALE_SECONDS: int = 1800
+SCREENPIPE_STALE_SECONDS: int = 600
 MAX_FRAME_DROP_RATE: float = 0.95
 RESTART_COOLDOWN: int = 600  # 10 min (was 30 min)
 CONSECUTIVE_FAILURES_BEFORE_RESTART: int = 3
@@ -669,6 +669,30 @@ def _is_screenpipe_running() -> bool:
     return result.returncode == 0
 
 
+def _ensure_preferred_audio_device() -> None:
+    """Activate the preferred audio input device after a Screenpipe restart.
+
+    Waits for the API to become available, then starts the configured device.
+    """
+    preferred: str | None = None
+    try:
+        cfg = load_config()
+        preferred = cfg.get("screenpipe", {}).get("preferred_input_device")
+    except Exception:
+        pass
+    if not preferred:
+        return
+
+    for attempt in range(6):
+        _time.sleep(5)
+        if _screenpipe_post("/audio/device/start", {"device_name": preferred}):
+            logger.info("Activated preferred audio device: %s", preferred)
+            return
+        logger.debug("Waiting for Screenpipe API (attempt %d/6)", attempt + 1)
+
+    logger.warning("Failed to activate preferred audio device '%s' after restart", preferred)
+
+
 def _restart_screenpipe(reason: str) -> None:
     """Kill and relaunch Screenpipe."""
     logger.warning("Restarting Screenpipe — %s", reason)
@@ -676,6 +700,7 @@ def _restart_screenpipe(reason: str) -> None:
     _time.sleep(5)
     subprocess.run(["open", "-a", "screenpipe"], timeout=10, capture_output=True)
     _time.sleep(10)
+    _ensure_preferred_audio_device()
     hs = _load_heal_state()
     hs["consecutive_no_data"] = 0
     hs["consecutive_degraded"] = 0
@@ -714,7 +739,11 @@ def _screenpipe_post(path: str, body: dict[str, Any]) -> bool:
 
 
 def _cycle_audio_devices() -> None:
-    """Stop and restart all active audio devices via the Screenpipe API."""
+    """Stop and restart audio devices via the Screenpipe API.
+
+    When a preferred_input_device is configured in config.yaml, only that
+    device is cycled.  Otherwise all devices are cycled (legacy behaviour).
+    """
     try:
         req = _urllib_request.Request("http://localhost:3030/audio/list", method="GET")
         with _urllib_request.urlopen(req, timeout=5) as resp:
@@ -723,10 +752,19 @@ def _cycle_audio_devices() -> None:
         logger.warning("Cannot list audio devices — Screenpipe API unreachable")
         return
 
+    preferred: str | None = None
+    try:
+        cfg = load_config()
+        preferred = cfg.get("screenpipe", {}).get("preferred_input_device")
+    except Exception:
+        pass
+
     cycled = 0
     for dev in devices:
         name = dev.get("name", "")
         if not name:
+            continue
+        if preferred and name != preferred:
             continue
         _screenpipe_post("/audio/device/stop", {"device_name": name})
         _time.sleep(1)
@@ -734,7 +772,55 @@ def _cycle_audio_devices() -> None:
         _time.sleep(1)
         cycled += 1
 
-    logger.info("Cycled %d audio devices to reset VAD state", cycled)
+    logger.info(
+        "Cycled %d audio device(s) to reset VAD state%s",
+        cycled,
+        f" (preferred: {preferred})" if preferred else "",
+    )
+
+
+def _enforce_preferred_device_only() -> None:
+    """Stop all input devices except the preferred one.
+
+    Screenpipe's device_monitor re-adds devices when system defaults change,
+    causing USB reconnect sounds.  This prunes unwanted devices each cycle.
+    """
+    preferred: str | None = None
+    try:
+        cfg = load_config()
+        preferred = cfg.get("screenpipe", {}).get("preferred_input_device")
+    except Exception:
+        return
+    if not preferred:
+        return
+
+    try:
+        req = _urllib_request.Request("http://localhost:3030/audio/list", method="GET")
+        with _urllib_request.urlopen(req, timeout=5) as resp:
+            devices = _json.loads(resp.read())
+    except Exception:
+        return
+
+    stopped = 0
+    preferred_found = False
+    for dev in devices:
+        name = dev.get("name", "")
+        if not name or "(output)" in name:
+            continue
+        if name == preferred:
+            preferred_found = True
+            continue
+        if _screenpipe_post("/audio/device/stop", {"device_name": name}):
+            stopped += 1
+
+    if not preferred_found:
+        _screenpipe_post("/audio/device/start", {"device_name": preferred})
+
+    if stopped:
+        logger.info(
+            "Enforced single-device mode: stopped %d unwanted input device(s)",
+            stopped,
+        )
 
 
 AUDIO_STALE_CYCLES: int = 2  # 2 cycles * 5 min = 10 min of silence triggers reset
@@ -772,6 +858,7 @@ def _check_audio_staleness(had_audio: bool) -> None:
                 "cycling audio devices", no_audio,
             )
             _cycle_audio_devices()
+            _enforce_preferred_device_only()
             hs["consecutive_no_audio"] = 0
             hs["last_audio_cycle_epoch"] = _time.time()
             _save_heal_state(hs)
@@ -818,7 +905,31 @@ def _check_screenpipe_health(db_path: str) -> None:
                 hs["consecutive_degraded"] = 0
                 _save_heal_state(hs)
 
-    # Signal 3: DB staleness (no new data written)
+    # Signal 3: DB-timestamp freshness (catches "healthy API but no DB writes")
+    try:
+        _conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        row = _conn.execute("SELECT MAX(timestamp) FROM frames").fetchone()
+        _conn.close()
+        if row and row[0]:
+            from datetime import timezone as _tz
+            ts_str = row[0]
+            if "+" in ts_str or ts_str.endswith("Z"):
+                last_frame_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            else:
+                last_frame_dt = datetime.fromisoformat(ts_str).replace(tzinfo=_tz.utc)
+            db_age = (datetime.now(_tz.utc) - last_frame_dt).total_seconds()
+            if db_age > SCREENPIPE_STALE_SECONDS:
+                no_data_count = hs.get("consecutive_no_data", 0)
+                if no_data_count >= CONSECUTIVE_FAILURES_BEFORE_RESTART and _can_restart():
+                    _restart_screenpipe(
+                        f"DB frames stale for {db_age / 60:.0f}m (API may report healthy), "
+                        f"{no_data_count} cycles with no data"
+                    )
+                    return
+    except Exception as e:
+        logger.debug("DB-timestamp check failed: %s", e)
+
+    # Signal 4: DB file-mtime staleness (fallback)
     db = Path(db_path)
     if not db.is_file():
         return
@@ -829,9 +940,12 @@ def _check_screenpipe_health(db_path: str) -> None:
     if stale_seconds > SCREENPIPE_STALE_SECONDS and no_data_count >= CONSECUTIVE_FAILURES_BEFORE_RESTART:
         if _can_restart():
             _restart_screenpipe(
-                f"DB stale for {stale_seconds / 60:.0f}m, "
+                f"DB file stale for {stale_seconds / 60:.0f}m, "
                 f"{no_data_count} cycles with no data"
             )
+            return
+
+    _enforce_preferred_device_only()
 
 
 # ── Main extraction logic ───────────────────────────────────────────────────
@@ -866,6 +980,21 @@ def run(cfg: dict[str, Any], *, dry_run: bool = False) -> None:
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        max_frame = conn.execute("SELECT MAX(id) FROM frames").fetchone()[0] or 0
+        max_audio = conn.execute("SELECT MAX(id) FROM audio_transcriptions").fetchone()[0] or 0
+        if last_frame_id > max_frame:
+            logger.warning(
+                "Frame cursor %d ahead of DB max %d — resetting to 0 (DB may have been rebuilt)",
+                last_frame_id, max_frame,
+            )
+            last_frame_id = 0
+        if last_audio_id > max_audio:
+            logger.warning(
+                "Audio cursor %d ahead of DB max %d — resetting to 0",
+                last_audio_id, max_audio,
+            )
+            last_audio_id = 0
+
         ocr_rows = conn.execute(QUERY_OCR, (last_frame_id,)).fetchall()
         audio_rows = conn.execute(QUERY_AUDIO, (last_audio_id,)).fetchall()
 

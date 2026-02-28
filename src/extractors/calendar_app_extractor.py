@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import subprocess
 import sys
 import time as _time
@@ -56,6 +57,65 @@ def _ensure_calendar_app() -> bool:
     return True
 
 
+_HEAL_CAL_FILE = Path(__file__).resolve().parent.parent.parent / "config" / "heal_calendar.json"
+_MAX_CAL_FAILURES_BEFORE_RESTART: int = 2
+
+
+def _load_cal_heal() -> dict[str, Any]:
+    if _HEAL_CAL_FILE.is_file():
+        try:
+            import json
+            return json.loads(_HEAL_CAL_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_cal_heal(hs: dict[str, Any]) -> None:
+    import json
+    _HEAL_CAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _HEAL_CAL_FILE.write_text(json.dumps(hs, indent=2, default=str))
+
+
+def _restart_calendar_app(reason: str) -> None:
+    """Force-quit and reopen Calendar.app to clear hung state."""
+    logger.warning("Restarting Calendar.app (%s)", reason)
+    subprocess.run(
+        ["pkill", "-f", "Calendar.app/Contents/MacOS/Calendar"],
+        timeout=10, capture_output=True,
+    )
+    _time.sleep(5)
+    subprocess.run(["open", "-g", "-j", "-a", "Calendar"], timeout=10, capture_output=True)
+    _time.sleep(10)
+    logger.info("Calendar.app restarted")
+    hs = _load_cal_heal()
+    hs["consecutive_failures"] = 0
+    hs["last_restart_reason"] = reason
+    hs["last_restart_epoch"] = _time.time()
+    _save_cal_heal(hs)
+
+
+def _record_cal_failure(reason: str) -> bool:
+    """Record a failure and return True if Calendar.app should be restarted."""
+    hs = _load_cal_heal()
+    count = hs.get("consecutive_failures", 0) + 1
+    hs["consecutive_failures"] = count
+    hs["last_failure_reason"] = reason
+    _save_cal_heal(hs)
+    logger.warning(
+        "Calendar.app failure [%d/%d]: %s",
+        count, _MAX_CAL_FAILURES_BEFORE_RESTART, reason,
+    )
+    return count >= _MAX_CAL_FAILURES_BEFORE_RESTART
+
+
+def _reset_cal_failures() -> None:
+    hs = _load_cal_heal()
+    if hs.get("consecutive_failures", 0) > 0:
+        hs["consecutive_failures"] = 0
+        _save_cal_heal(hs)
+
+
 # ── AppleScript helpers ──────────────────────────────────────────────────────
 
 def _run_osascript(script: str, *, timeout: int = 120) -> str:
@@ -71,6 +131,8 @@ def _run_osascript(script: str, *, timeout: int = 120) -> str:
             "AppleScript timed out after %ds (Calendar.app may still be syncing)",
             timeout,
         )
+        if _record_cal_failure(f"AppleScript timeout after {timeout}s"):
+            _restart_calendar_app(f"AppleScript timeout after {timeout}s")
         return ""
     if result.returncode != 0:
         stderr = result.stderr.strip()
@@ -87,6 +149,17 @@ def _run_osascript(script: str, *, timeout: int = 120) -> str:
 
 # ── Calendar.app data extraction ─────────────────────────────────────────────
 
+def _reload_calendars() -> None:
+    """Ask Calendar.app to refresh its Exchange/iCloud sync."""
+    try:
+        _run_osascript(
+            'tell application "Calendar" to reload calendars',
+            timeout=30,
+        )
+    except Exception:
+        logger.debug("reload calendars failed (non-fatal)", exc_info=True)
+
+
 def fetch_events(
     calendar_names: list[str],
     start: datetime,
@@ -97,6 +170,9 @@ def fetch_events(
     Returns a list of dicts with keys: summary, start_date, start_time,
     end_date, end_time, location, is_all_day, attendees, organizer, notes.
     """
+    _reload_calendars()
+    _time.sleep(2)
+
     start_str = start.strftime("%A, %B %d, %Y at %I:%M:%S %p")
     end_str = end.strftime("%A, %B %d, %Y at %I:%M:%S %p")
 
@@ -191,6 +267,7 @@ end tell
 def _parse_applescript_date(date_str: str) -> datetime | None:
     if not date_str:
         return None
+    date_str = date_str.replace("\u202f", " ").replace("\u00a0", " ")
     fmts = [
         "%A, %B %d, %Y at %I:%M:%S %p",
         "%A, %B %d, %Y at %H:%M:%S",
@@ -268,22 +345,24 @@ end tell
 '''
     raw = _run_osascript(script, timeout=60)
     if not raw:
-        logger.info("Attendee enrichment returned no data for %s", date.strftime("%Y-%m-%d"))
-        return
+        logger.warning("Attendee enrichment AppleScript returned no data for %s — trying fallback", date.strftime("%Y-%m-%d"))
+    else:
+        logger.info("Attendee enrichment AppleScript returned %d bytes for %s", len(raw), date.strftime("%Y-%m-%d"))
 
-    lookup: dict[str, dict[str, str]] = {}
-    for record in raw.split(RECORD_SEP):
-        record = record.strip()
-        if not record:
-            continue
-        fields = record.split(FIELD_SEP)
-        if len(fields) < 2:
-            continue
-        summ = fields[0].strip()
-        att_str = fields[2].strip() if len(fields) > 2 else ""
-        notes = fields[3].strip() if len(fields) > 3 else ""
-        attendees = [a.strip() for a in att_str.split(",") if a.strip()]
-        lookup[summ] = {"attendees": attendees, "notes": notes}
+    lookup: dict[str, dict[str, Any]] = {}
+    if raw:
+        for record in raw.split(RECORD_SEP):
+            record = record.strip()
+            if not record:
+                continue
+            fields = record.split(FIELD_SEP)
+            if len(fields) < 2:
+                continue
+            summ = fields[0].strip()
+            att_str = fields[2].strip() if len(fields) > 2 else ""
+            notes = fields[3].strip() if len(fields) > 3 else ""
+            attendees = [a.strip() for a in att_str.split(",") if a.strip()]
+            lookup[summ] = {"attendees": attendees, "notes": notes}
 
     enriched = 0
     for ev in events:
@@ -295,11 +374,65 @@ end tell
                 ev["notes"] = info["notes"]
             enriched += 1
 
-    if enriched:
-        logger.info("Enriched %d/%d events with attendees for %s", enriched, len(events), date.strftime("%Y-%m-%d"))
+    fallback_count = 0
+    for ev in events:
+        if ev.get("attendees"):
+            continue
+        notes = ev.get("notes", "")
+        if not notes:
+            continue
+        import re
+        name_patterns = re.findall(
+            r'(?:Required|Optional):\s*([^\n]+)',
+            notes, re.IGNORECASE,
+        )
+        if not name_patterns:
+            name_patterns = re.findall(
+                r'([A-Z][a-z]+ [A-Z][a-z]+)(?:\s*[,;]|\s*$)',
+                notes[:2000],
+            )
+        if name_patterns:
+            names = []
+            for chunk in name_patterns:
+                for n in chunk.split(";"):
+                    n = n.strip().rstrip(",")
+                    if n and len(n) > 3 and len(n) < 60:
+                        names.append(n)
+            if names:
+                ev["attendees"] = names[:20]
+                fallback_count += 1
+
+    total = enriched + fallback_count
+    if total:
+        logger.info("Enriched %d events with attendees for %s (AppleScript: %d, fallback: %d)",
+                     total, date.strftime("%Y-%m-%d"), enriched, fallback_count)
+    else:
+        logger.warning("No attendees found for any events on %s", date.strftime("%Y-%m-%d"))
 
 
 # ── Markdown rendering ───────────────────────────────────────────────────────
+
+_TEAMS_NOISE_PATTERNS = [
+    re.compile(r"https?://teams\.microsoft\.com/\S+", re.IGNORECASE),
+    re.compile(r"https?://aka\.ms/\S+", re.IGNORECASE),
+    re.compile(r"Meeting\s+ID:\s*[\d\s]+", re.IGNORECASE),
+    re.compile(r"Passcode:\s*\S+", re.IGNORECASE),
+    re.compile(r"_{10,}"),
+    re.compile(r"Need help\?.*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"System reference.*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"Microsoft Teams meeting\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"Join:?\s*$", re.MULTILINE),
+    re.compile(r"\[​[^\]]*\]\s*", re.IGNORECASE),
+]
+
+
+def _clean_notes(text: str) -> str:
+    """Strip Teams join URLs, meeting IDs, passcodes, and boilerplate from notes."""
+    for pat in _TEAMS_NOISE_PATTERNS:
+        text = pat.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 
 def render_calendar_note(
     date_str: str,
@@ -334,14 +467,80 @@ def render_calendar_note(
         if ev.get("attendees"):
             parts.append(f"- **Attendees:** {', '.join(ev['attendees'])}")
         if ev.get("notes"):
-            notes_text = ev["notes"][:500]
-            if len(ev["notes"]) > 500:
-                notes_text += "..."
-            parts.append(f"- **Notes:** {notes_text}")
+            cleaned = _clean_notes(ev["notes"])
+            if cleaned:
+                notes_text = cleaned[:500]
+                if len(cleaned) > 500:
+                    notes_text += "..."
+                parts.append(f"- **Notes:** {notes_text}")
 
         parts.append("")
 
     return "\n".join(parts)
+
+
+_EXISTING_EVENT_RE = re.compile(
+    r"^##\s+(?:All Day:\s*(.+)|(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2}):\s*(.+))",
+    re.MULTILINE,
+)
+_EXISTING_SECTION_RE = re.compile(r"^## ", re.MULTILINE)
+
+
+def _parse_existing_events(text: str) -> list[dict[str, Any]]:
+    """Parse summary + start_time from an existing calendar.md file.
+
+    Returns lightweight dicts with ``summary`` and ``start_time`` keys so
+    we can merge with freshly-extracted events without losing old data.
+    """
+    events: list[dict[str, Any]] = []
+    sections = _EXISTING_SECTION_RE.split(text)
+    for m in _EXISTING_EVENT_RE.finditer(text):
+        if m.group(1):
+            events.append({
+                "summary": m.group(1).strip(),
+                "start_time": "00:00",
+                "end_time": "23:59",
+                "is_all_day": True,
+            })
+        else:
+            events.append({
+                "summary": m.group(4).strip(),
+                "start_time": m.group(2),
+                "end_time": m.group(3),
+                "is_all_day": False,
+            })
+    return events
+
+
+def _merge_events(
+    new_events: list[dict[str, Any]],
+    existing_text: str,
+) -> list[dict[str, Any]]:
+    """Merge freshly-extracted events with events already in the file.
+
+    Strategy: keep all new events, then append any old events whose
+    (summary, start_time) key is not present in the new set.  This
+    prevents a flaky 1-event extraction from wiping the file while
+    still allowing cancelled meetings to eventually disappear when a
+    healthy extraction runs.
+    """
+    new_keys: set[tuple[str, str]] = set()
+    for ev in new_events:
+        new_keys.add((ev.get("summary", ""), ev.get("start_time", "")))
+
+    old_events = _parse_existing_events(existing_text)
+    carried = 0
+    for old in old_events:
+        key = (old.get("summary", ""), old.get("start_time", ""))
+        if key not in new_keys:
+            new_events.append(old)
+            new_keys.add(key)
+            carried += 1
+
+    if carried:
+        logger.info("Merged %d existing events not in new extraction", carried)
+
+    return new_events
 
 
 # ── Main extraction logic ───────────────────────────────────────────────────
@@ -377,6 +576,45 @@ def run(
 
     raw_events = fetch_events(calendar_names, start, end)
 
+    date_range_days = (end - start).days
+    min_expected = 5 if date_range_days >= 7 else 1
+    _sync_glitch = len(raw_events) < min_expected
+    if _sync_glitch:
+        should_restart = _record_cal_failure(
+            f"sync glitch: {len(raw_events)} events for {date_range_days}-day range"
+        )
+        logger.warning(
+            "Only %d events returned for a %d-day range — sync glitch "
+            "(restart_threshold=%s)",
+            len(raw_events), date_range_days, "REACHED" if should_restart else "not yet",
+        )
+
+        if should_restart:
+            _restart_calendar_app(f"sync glitch persisted ({len(raw_events)} events)")
+            _time.sleep(15)
+            retry_events = fetch_events(calendar_names, start, end)
+            if len(retry_events) >= min_expected:
+                logger.info("Retry after restart fixed: %d -> %d events", len(raw_events), len(retry_events))
+                raw_events = retry_events
+                _reset_cal_failures()
+            else:
+                logger.warning("Retry after restart still bad (%d events)", len(retry_events))
+                if len(retry_events) > len(raw_events):
+                    raw_events = retry_events
+        else:
+            _reload_calendars()
+            _time.sleep(15)
+            retry_events = fetch_events(calendar_names, start, end)
+            if len(retry_events) >= min_expected:
+                logger.info("Retry after reload fixed: %d -> %d events", len(raw_events), len(retry_events))
+                raw_events = retry_events
+                _reset_cal_failures()
+            elif len(retry_events) > len(raw_events):
+                logger.info("Retry after reload improved: %d -> %d events", len(raw_events), len(retry_events))
+                raw_events = retry_events
+            else:
+                logger.warning("Retry did not improve (%d events); proceeding with best result", len(retry_events))
+
     if not raw_events:
         logger.info("No calendar events found")
         if not dry_run:
@@ -388,6 +626,37 @@ def run(
         return
 
     logger.info("Processing %d calendar events", len(raw_events))
+
+    # Fix recurring events: Calendar.app sometimes returns the series start
+    # date instead of the occurrence date.  Any event whose start_date falls
+    # outside the query range is a recurring occurrence -- reassign it to the
+    # nearest matching weekday inside the range.
+    range_start_str = start.strftime("%Y-%m-%d")
+    range_end_str = end.strftime("%Y-%m-%d")
+    reassigned = 0
+    for ev in raw_events:
+        ds = ev.get("start_date", "unknown")
+        if ds == "unknown" or range_start_str <= ds <= range_end_str:
+            continue
+        try:
+            orig = datetime.strptime(ds, "%Y-%m-%d")
+            target_weekday = orig.weekday()
+            candidate = start
+            while candidate <= end:
+                if candidate.weekday() == target_weekday:
+                    new_ds = candidate.strftime("%Y-%m-%d")
+                    if new_ds not in [e.get("start_date") for e in raw_events
+                                      if e.get("summary") == ev.get("summary")
+                                      and range_start_str <= e.get("start_date", "") <= range_end_str]:
+                        ev["start_date"] = new_ds
+                        ev["end_date"] = new_ds
+                        reassigned += 1
+                        break
+                candidate += timedelta(days=1)
+        except ValueError:
+            pass
+    if reassigned:
+        logger.info("Reassigned %d recurring events to correct occurrence dates", reassigned)
 
     daily_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for ev in raw_events:
@@ -431,6 +700,15 @@ def run(
         )
         cal_path = cal_dir / cal_date_path / "calendar.md"
 
+        if cal_path.is_file():
+            existing_text = cal_path.read_text(encoding="utf-8", errors="replace")
+            events = _merge_events(events, existing_text)
+            events = sorted(events, key=lambda e: (
+                not e.get("is_all_day"),
+                e.get("start_time", ""),
+            ))
+            cal_content = render_calendar_note(date_str, events)
+
         if dry_run:
             logger.info("DRY RUN: Would write %s (%d events)", cal_path, len(events))
         else:
@@ -444,6 +722,8 @@ def run(
         save_state(state_path, state)
         logger.info("Updated calendar_app cursor: %s", now.isoformat())
 
+    if not _sync_glitch:
+        _reset_cal_failures()
     logger.info(
         "Calendar.app extraction complete: %d events across %d days",
         len(raw_events), len(daily_events),

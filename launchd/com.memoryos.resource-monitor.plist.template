@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memoryos.resource-monitor</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{VENV_PYTHON}}</string>
+        <string>{{REPO_DIR}}/src/monitor/resource_monitor.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{REPO_DIR}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{REPO_DIR}}/logs/resource_monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{REPO_DIR}}/logs/resource_monitor.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>{{REPO_DIR}}</string>
+    </dict>
+</dict>
+</plist>

@@ -40,6 +40,15 @@ STALE_THRESHOLDS = {
     "dashboard": 60,
 }
 
+SCREENPIPE_DB_PATH = Path.home() / ".screenpipe" / "db.sqlite"
+SCREENPIPE_DB_STALE_SECONDS = 600
+
+ESCALATION_THRESHOLDS = [
+    (5 * 60, "MemoryOS: data collection down 5 min", "Attempting automatic recovery"),
+    (15 * 60, "DATA COLLECTION DOWN 15 min", "May need manual intervention"),
+    (30 * 60, "DATA COLLECTION DOWN 30 min", "You are losing data. Consider restarting your machine."),
+]
+
 EXPECTED_AGENTS = [
     "com.memoryos.screenpipe",
     "com.memoryos.outlook",
@@ -50,6 +59,8 @@ EXPECTED_AGENTS = [
     "com.memoryos.calendar-app",
     "com.memoryos.watchdog",
     "com.memoryos.sentinel",
+    "com.memoryos.resource-monitor",
+    "com.memoryos.activity-summarizer",
 ]
 
 
@@ -134,6 +145,31 @@ def check_screenpipe() -> dict[str, str]:
     return results
 
 
+def check_screenpipe_db_freshness() -> tuple[str, str]:
+    """Check Screenpipe DB for actual data freshness (catches healthy-API-but-no-data)."""
+    if not SCREENPIPE_DB_PATH.is_file():
+        return "down", "Screenpipe DB not found"
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(SCREENPIPE_DB_PATH), timeout=5)
+        row = conn.execute("SELECT MAX(timestamp) FROM frames").fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return "down", "No frames in Screenpipe DB"
+        from datetime import datetime, timezone
+        ts = row[0]
+        if "+" in ts or ts.endswith("Z"):
+            last_frame = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        else:
+            last_frame = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - last_frame).total_seconds()
+        if age > SCREENPIPE_DB_STALE_SECONDS:
+            return "stale", f"Last frame {age/60:.0f}m ago (DB stale)"
+        return "healthy", f"Last frame {age:.0f}s ago"
+    except Exception as e:
+        return "stale", f"Cannot query Screenpipe DB: {e}"
+
+
 def check_folder_freshness(
     vault_path: Path,
     folder: str,
@@ -201,9 +237,37 @@ def check_launchd_agents() -> tuple[str, str]:
     return "healthy", "All agents loaded"
 
 
+RESOURCE_MONITOR_STATE_FILE = REPO_DIR / "config" / "resource_monitor_state.json"
+
+
+def check_resource_health() -> tuple[str, str]:
+    """Check system resource health via the resource monitor's state file."""
+    if not RESOURCE_MONITOR_STATE_FILE.is_file():
+        return "unknown", "Resource monitor not yet running"
+    try:
+        data = json.loads(RESOURCE_MONITOR_STATE_FILE.read_text())
+        age = time.time() - datetime.fromisoformat(data["last_check"]).timestamp()
+        if age > 300:
+            return "stale", f"Resource monitor data is {age / 60:.0f}m old"
+        level = data.get("level", "unknown")
+        if level == "critical":
+            alerts = data.get("alerts", [])
+            critical = [a["message"] for a in alerts if a.get("severity") == "critical"]
+            return "down", "; ".join(critical[:2]) or "Critical resource pressure"
+        if level == "warning":
+            alerts = data.get("alerts", [])
+            warnings = [a["message"] for a in alerts if a.get("severity") == "warning"]
+            return "stale", "; ".join(warnings[:2]) or "Resource usage elevated"
+        sys_info = data.get("system", {})
+        ram = sys_info.get("ram_available_gb", "?")
+        return "healthy", f"RAM: {ram} GB free"
+    except Exception as e:
+        return "stale", f"Cannot read resource state: {e}"
+
+
 # ── Active Recovery ───────────────────────────────────────────────────────────
 
-RECOVERY_COOLDOWN = 300  # 5 min between recovery attempts (was 30 min)
+RECOVERY_COOLDOWN = 120  # 2 min between recovery attempts
 
 
 def _recovery_allowed(component: str, prev_state: dict[str, Any]) -> bool:
@@ -236,8 +300,73 @@ def _recover_app(app_name: str, bundle_pattern: str) -> bool:
         return False
 
 
+def _activate_preferred_audio_device() -> None:
+    """Activate the preferred audio input device and stop all others.
+
+    Screenpipe's device_monitor re-adds devices when system defaults change,
+    causing USB reconnect sounds.  After starting the preferred device we
+    explicitly stop every other input device to prevent cascading restarts.
+    """
+    try:
+        cfg = load_config()
+        preferred = cfg.get("screenpipe", {}).get("preferred_input_device")
+    except Exception:
+        return
+    if not preferred:
+        return
+
+    import urllib.request
+
+    activated = False
+    for attempt in range(6):
+        time.sleep(5)
+        try:
+            data = json.dumps({"device_name": preferred}).encode()
+            req = urllib.request.Request(
+                "http://localhost:3030/audio/device/start",
+                data=data, method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    logger.info("Activated preferred audio device: %s", preferred)
+                    activated = True
+                    break
+        except Exception:
+            pass
+
+    if not activated:
+        logger.warning("Failed to activate preferred audio device '%s' after restart", preferred)
+        return
+
+    try:
+        req = urllib.request.Request("http://localhost:3030/audio/list", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            devices = json.loads(resp.read())
+        stopped = 0
+        for dev in devices:
+            name = dev.get("name", "")
+            if not name or "(output)" in name or name == preferred:
+                continue
+            try:
+                stop_data = json.dumps({"device_name": name}).encode()
+                stop_req = urllib.request.Request(
+                    "http://localhost:3030/audio/device/stop",
+                    data=stop_data, method="POST",
+                )
+                stop_req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(stop_req, timeout=10):
+                    stopped += 1
+            except Exception:
+                pass
+        if stopped:
+            logger.info("Stopped %d unwanted input device(s)", stopped)
+    except Exception:
+        pass
+
+
 def _recover_screenpipe() -> bool:
-    """Kill stale Screenpipe and relaunch."""
+    """Kill stale Screenpipe and relaunch, then activate preferred audio device."""
     logger.info("Recovery: restarting Screenpipe")
     try:
         subprocess.run(
@@ -247,6 +376,8 @@ def _recover_screenpipe() -> bool:
         subprocess.run(
             ["open", "-a", "screenpipe"], timeout=10, capture_output=True,
         )
+        time.sleep(10)
+        _activate_preferred_audio_device()
         return True
     except Exception as e:
         logger.warning("Recovery: Screenpipe restart failed: %s", e)
@@ -266,6 +397,22 @@ def _recover_mail_app() -> bool:
         return True
     except Exception as e:
         logger.warning("Recovery: Mail.app restart failed: %s", e)
+        return False
+
+
+def _recover_calendar_app() -> bool:
+    """Force-restart Calendar.app to clear hung AppleEvent state."""
+    logger.info("Recovery: restarting Calendar.app")
+    try:
+        subprocess.run(
+            ["pkill", "-f", "Calendar.app/Contents/MacOS/Calendar"],
+            timeout=10, capture_output=True,
+        )
+        time.sleep(5)
+        subprocess.run(["open", "-a", "Calendar"], timeout=10, capture_output=True)
+        return True
+    except Exception as e:
+        logger.warning("Recovery: Calendar.app restart failed: %s", e)
         return False
 
 
@@ -352,7 +499,10 @@ def attempt_recovery(
         if _recovery_allowed("calendar_app", prev_state):
             if _recover_app("Calendar", r"Calendar.app/Contents/MacOS/Calendar$"):
                 _record_recovery("calendar_app", prev_state)
-                recovered.append("Calendar.app")
+                recovered.append("Calendar.app (launched)")
+            elif _recover_calendar_app():
+                _record_recovery("calendar_app", prev_state)
+                recovered.append("Calendar.app (restarted)")
 
     dash_status = results.get("dashboard", {}).get("status", "")
     if dash_status == "down":
@@ -360,6 +510,24 @@ def attempt_recovery(
             if _recover_dashboard():
                 _record_recovery("dashboard", prev_state)
                 recovered.append("Dashboard")
+
+    activity_status = results.get("activity", {}).get("status", "")
+    if activity_status in ("down", "stale"):
+        if _recovery_allowed("activity", prev_state):
+            uid = os.getuid()
+            restarted: list[str] = []
+            for agent in ("com.memoryos.screenpipe", "com.memoryos.activity-summarizer"):
+                try:
+                    subprocess.run(
+                        ["launchctl", "kickstart", "-k", f"gui/{uid}/{agent}"],
+                        capture_output=True, timeout=15,
+                    )
+                    restarted.append(agent)
+                except Exception as e:
+                    logger.warning("Recovery: failed to kickstart %s: %s", agent, e)
+            if restarted:
+                _record_recovery("activity", prev_state)
+                recovered.append(f"Activity pipeline ({', '.join(restarted)})")
 
     launchd_status = results.get("launchd", {}).get("status", "")
     if launchd_status in ("stale", "down"):
@@ -390,6 +558,12 @@ def run_checks(cfg: dict[str, Any]) -> dict[str, dict[str, str]]:
         "detail": sp.get("screenpipe_audio_detail", ""),
     }
 
+    db_status, db_detail = check_screenpipe_db_freshness()
+    if db_status != "healthy" and results["screenpipe_frames"]["status"] == "healthy":
+        results["screenpipe_frames"]["status"] = db_status
+        results["screenpipe_frames"]["detail"] = db_detail
+        logger.warning("Screenpipe API healthy but DB stale: %s", db_detail)
+
     for component, folder, threshold in [
         ("email", cfg["output"]["email"], STALE_THRESHOLDS["email"]),
         ("meetings", cfg["output"]["meetings"], STALE_THRESHOLDS["meetings"]),
@@ -405,6 +579,9 @@ def run_checks(cfg: dict[str, Any]) -> dict[str, dict[str, str]]:
     status, detail = check_launchd_agents()
     results["launchd"] = {"status": status, "detail": detail}
 
+    status, detail = check_resource_health()
+    results["resources"] = {"status": status, "detail": detail}
+
     return results
 
 
@@ -417,6 +594,7 @@ FRIENDLY_NAMES = {
     "teams": "Teams Chat",
     "dashboard": "Dashboard",
     "launchd": "Background Agents",
+    "resources": "System Resources",
 }
 
 
@@ -474,6 +652,34 @@ def evaluate_and_notify(results: dict[str, dict[str, str]]) -> None:
         if s == "stale":
             overall = "degraded"
 
+    # ── Escalation: track how long critical collectors have been unhealthy ──
+    critical_components = ("screenpipe_frames", "screenpipe_audio")
+    now_ts = time.time()
+    down_since = prev_state.get("down_since", {})
+    last_escalation_level = prev_state.get("last_escalation_level", {})
+
+    for comp in critical_components:
+        status = new_statuses.get(comp, "healthy")
+        if status in ("down", "stale"):
+            if comp not in down_since:
+                down_since[comp] = now_ts
+            down_duration = now_ts - down_since[comp]
+            for threshold_secs, title, message in ESCALATION_THRESHOLDS:
+                prev_level = last_escalation_level.get(comp, 0)
+                if down_duration >= threshold_secs and prev_level < threshold_secs:
+                    name = FRIENDLY_NAMES.get(comp, comp)
+                    notify(title, name, message)
+                    logger.warning(
+                        "ESCALATION: %s down for %dm -- %s",
+                        name, down_duration / 60, message,
+                    )
+                    last_escalation_level[comp] = threshold_secs
+        else:
+            if comp in down_since:
+                del down_since[comp]
+            if comp in last_escalation_level:
+                del last_escalation_level[comp]
+
     save_watchdog_state({
         "statuses": new_statuses,
         "results": {k: v for k, v in results.items()},
@@ -483,6 +689,8 @@ def evaluate_and_notify(results: dict[str, dict[str, str]]) -> None:
         "recoveries_sent": len(recoveries),
         "self_healed": healed,
         "recovery_attempts": prev_state.get("recovery_attempts", {}),
+        "down_since": down_since,
+        "last_escalation_level": last_escalation_level,
     })
 
     logger.info(

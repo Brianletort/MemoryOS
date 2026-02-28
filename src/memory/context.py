@@ -10,6 +10,7 @@ Produces Markdown summaries in ``_context/`` that any AI tool can read directly:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -131,13 +132,13 @@ def _generate_today(index: Any, out: Path, now: datetime) -> None:
             if "calendar" in title.lower():
                 lines.append(f"### Calendar — `{path}`")
                 lines.append("")
-                preview = _meeting_preview(content, max_chars=4000)
+                preview = _meeting_preview(content, max_chars=12000)
                 if preview:
                     lines.append(preview)
             elif "audio" in title.lower():
                 lines.append(f"### Transcripts — `{path}`")
                 lines.append("")
-                preview = _meeting_preview(content, max_chars=4000)
+                preview = _meeting_preview(content, max_chars=8000)
                 if preview:
                     lines.append(preview)
             else:
@@ -253,8 +254,44 @@ def _generate_recent_emails(index: Any, out: Path, now: datetime) -> None:
     _write_if_changed(out / "recent_emails.md", "\n".join(lines) + "\n")
 
 
+_RE_MEETING_HEADER = re.compile(
+    r"^##\s+(?:All Day:\s*(.+)|(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2}):\s*(.+))",
+    re.MULTILINE,
+)
+_RE_ATTENDEES = re.compile(r"^\- \*\*Attendees:\*\*\s*(.+)", re.MULTILINE)
+
+
+def _calendar_summary(content: str) -> str:
+    """Extract a compact summary of meetings from a calendar markdown file."""
+    clean = _strip_frontmatter(content)
+    if not clean.strip():
+        return ""
+
+    events: list[str] = []
+    for m in _RE_MEETING_HEADER.finditer(clean):
+        if m.group(1):
+            events.append(f"  - All Day: {m.group(1).strip()}")
+        else:
+            events.append(f"  - {m.group(2)}-{m.group(3)}: {m.group(4).strip()}")
+
+    att_match = _RE_ATTENDEES.findall(clean)
+    all_names: set[str] = set()
+    for att_str in att_match:
+        for name in att_str.split(","):
+            name = name.strip()
+            if name:
+                all_names.add(name)
+
+    parts: list[str] = []
+    if events:
+        parts.extend(events)
+    if all_names:
+        parts.append(f"  - Key attendees: {', '.join(sorted(all_names)[:15])}")
+    return "\n".join(parts)
+
+
 def _generate_upcoming(index: Any, out: Path, now: datetime) -> None:
-    """Next 7 days of calendar events."""
+    """Next 7 days of calendar events with meeting titles, times, and attendees."""
     start = now
     end = now + timedelta(days=7)
 
@@ -280,9 +317,15 @@ def _generate_upcoming(index: Any, out: Path, now: datetime) -> None:
                 lines.append(f"## {day}")
                 lines.append("")
             lines.append(f"- **{doc['title']}** — `{doc['path']}`")
-            p = _preview(doc["content"], 200)
-            if p:
-                lines.append(f"  {p}")
+            content = doc.get("content", "")
+            if "calendar" in doc["title"].lower() and content:
+                summary = _calendar_summary(content)
+                if summary:
+                    lines.append(summary)
+            else:
+                p = _preview(content, 200)
+                if p:
+                    lines.append(f"  {p}")
         lines.append("")
 
     _write_if_changed(out / "upcoming.md", "\n".join(lines) + "\n")

@@ -152,10 +152,10 @@ def summarize_with_brave_ai(query: str, max_tokens: int = 300) -> str | None:
         "Accept": "application/json",
     }
     payload = {
-        "model": "brave-search",
+        "model": "brave",
         "messages": [{"role": "user", "content": query}],
-        "max_tokens": max_tokens,
         "stream": False,
+        "enable_citations": True,
     }
 
     try:
@@ -163,7 +163,7 @@ def summarize_with_brave_ai(query: str, max_tokens: int = 300) -> str | None:
             "https://api.search.brave.com/res/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=30,
+            timeout=8,
         )
         resp.raise_for_status()
         data = resp.json()

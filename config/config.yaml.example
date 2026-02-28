@@ -15,6 +15,7 @@ output:
   slides: 40_slides
   knowledge: 50_knowledge
   activity: 85_activity
+  recall: 87_recall
 
 # ---------------------------------------------------------------------------
 # Screenpipe -- screen OCR + audio transcription
@@ -23,6 +24,7 @@ output:
 # ---------------------------------------------------------------------------
 screenpipe:
   db_path: ~/.screenpipe/db.sqlite
+  preferred_input_device: null  # null = use all available; set to device name to pin (e.g. "MacBook Pro Microphone")
 
 # ---------------------------------------------------------------------------
 # Email & Calendar -- choose ONE of the three options below
@@ -88,6 +90,21 @@ screenpipe_settings:
   teams_app_names:
     - Microsoft Teams
 
+  # LLM-powered activity summarization -- all models configurable.
+  # Swap any model to ollama/local via agents.api_base.
+  summarizer:
+    enabled: true
+    model_summary: gpt-5-mini       # 30-min activity summaries (fast, cheap)
+    model_cleanup: gpt-5-nano       # Transcription cleanup (future)
+    model_digest: gpt-5.2-pro       # Daily digest (needs large context window)
+    model_weekly: gpt-5.2-pro       # Weekly deep analysis
+    reasoning_summary: none          # Fast for summaries
+    reasoning_digest: medium         # Moderate for daily digest
+    reasoning_weekly: high           # Deep for weekly analysis
+    max_input_chars: 50000           # Per-call truncation for 30-min summaries
+    max_input_chars_digest: 500000   # Daily digest gets more context
+    max_input_chars_weekly: 1000000  # Weekly analysis -- near-full context
+
 outlook_settings:
   backfill_workers: 8
   batch_size: 500
@@ -108,33 +125,26 @@ memory:
 
   # Pinned "core work context" files (vault-relative paths)
   # These are concatenated into _context/core.md by the context generator.
-  # Each user creates their own set of knowledge files.
+  # Customize this list with your own knowledge files.
   pinned_files:
-    - 50_knowledge/00_profile/brian_work_identity.md
-    - 50_knowledge/00_profile/digital_realty_context.md
+    - 50_knowledge/00_profile/my_work_identity.md
+    - 50_knowledge/00_profile/company_context.md
     - 50_knowledge/00_profile/work_memory_inclusion_rules.md
     - 50_knowledge/00_profile/tag_taxonomy.md
     - 50_knowledge/00_profile/maintenance_protocol.md
-    - 50_knowledge/01_programs/nexus_ai_platform.md
-    - 50_knowledge/01_programs/magellan_semantic_layer.md
+    - 50_knowledge/01_programs/project_alpha.md
+    - 50_knowledge/01_programs/semantic_layer.md
     - 50_knowledge/01_programs/data_governance_mdm.md
-    - 50_knowledge/01_programs/sales_ai_enablement.md
-    - 50_knowledge/01_programs/thought_leadership_llm_watch.md
-    - 50_knowledge/01_programs/ai_keynote_3000_attendees.md
+    - 50_knowledge/01_programs/sales_enablement.md
+    - 50_knowledge/01_programs/thought_leadership.md
     - 50_knowledge/01_programs/hiring_org_design.md
-    - 50_knowledge/01_programs/cursor_cost_and_scale.md
-    - 50_knowledge/01_programs/ai_digest_pipeline.md
-    - 50_knowledge/01_programs/servicenow_knowledge_ingestion.md
-    - 50_knowledge/01_programs/n8n_recreate_nexus_endpoints.md
     - 50_knowledge/03_patterns/reference_architecture_agentic_rag_app.md
-    - 50_knowledge/03_patterns/n8n_rag_and_agents_pattern.md
     - 50_knowledge/03_patterns/evaluation_observability_llm.md
     - 50_knowledge/03_patterns/human_in_the_loop_actions.md
     - 50_knowledge/03_patterns/executive_comms_templates.md
     - 50_knowledge/02_preferences/writing_and_feedback_preferences.md
     - 50_knowledge/02_preferences/dev_instructions_preferences.md
     - 50_knowledge/02_preferences/platform_tooling_preferences.md
-    - 50_knowledge/00_profile/pinned_core_context_design.md
 
 # ---------------------------------------------------------------------------
 # Agent skills -- headless LLM-powered skill execution

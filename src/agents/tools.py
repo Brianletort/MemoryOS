@@ -167,15 +167,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web for recent news or information using DuckDuckGo. "
-                "Use for current events, competitor info, or anything not in the vault."
+                "Search the web using Brave Search for current news, company info, "
+                "people, technology, or any external topic not in the vault. "
+                "Returns search results and optionally an AI-grounded summary."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query (plain text, will be split into keywords)",
+                        "description": "Search query (plain text)",
+                    },
+                    "search_type": {
+                        "type": "string",
+                        "description": "Type of search: 'news' for recent news, 'web' for general web, 'ai' for AI-grounded summary",
+                        "enum": ["news", "web", "ai"],
+                        "default": "web",
                     },
                     "max_results": {
                         "type": "integer",
@@ -276,6 +283,147 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "build_slides",
+            "description": (
+                "Build a PowerPoint (.pptx) slide deck. Returns a download URL. "
+                "Use when the user asks to create slides, a presentation, or a deck."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Deck title",
+                    },
+                    "subtitle": {
+                        "type": "string",
+                        "description": "Optional subtitle",
+                    },
+                    "theme": {
+                        "type": "string",
+                        "description": "Color theme: 'light' or 'dark'",
+                        "enum": ["light", "dark"],
+                        "default": "light",
+                    },
+                    "footer": {
+                        "type": "string",
+                        "description": "Optional footer text for all slides",
+                    },
+                    "slides": {
+                        "type": "array",
+                        "description": "Array of slide specs",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "description": "Slide type: title, header, content, metrics, comparison, takeaways",
+                                    "enum": ["title", "header", "content", "metrics", "comparison", "takeaways"],
+                                },
+                                "title": {"type": "string", "description": "Slide title"},
+                                "subtitle": {"type": "string", "description": "Subtitle (for title slides)"},
+                                "bullets": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Bullet points (for content slides)",
+                                },
+                                "metrics": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "description": "Metrics as [[value, label], ...] (for metrics slides)",
+                                },
+                                "headers": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Table headers (for comparison slides)",
+                                },
+                                "rows": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "description": "Table rows (for comparison slides)",
+                                },
+                                "items": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Takeaway items (for takeaways slides)",
+                                },
+                            },
+                            "required": ["type", "title"],
+                        },
+                    },
+                },
+                "required": ["title", "slides"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an image using AI (gpt-image-1.5). Returns a download URL "
+                "with the image embedded in markdown. Use when the user asks to create, "
+                "generate, or draw an image, diagram, infographic, or visual."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed description of the image to generate",
+                    },
+                    "style": {
+                        "type": "string",
+                        "description": "Visual style for the image",
+                        "enum": ["editorial", "infographic", "diagram", "calendar", "thumbnail"],
+                        "default": "editorial",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Image dimensions",
+                        "enum": ["1024x1024", "1024x1536", "1536x1024"],
+                        "default": "1024x1024",
+                    },
+                    "quality": {
+                        "type": "string",
+                        "description": "Quality tier (low=fast/cheap, high=best)",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_file",
+            "description": (
+                "Analyze an uploaded file. Extracts text from PDF, DOCX, CSV, Excel, "
+                "or plain text files and returns the content for analysis."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stored_name": {
+                        "type": "string",
+                        "description": "The stored filename returned by the file upload",
+                    },
+                },
+                "required": ["stored_name"],
+            },
+        },
+    },
 ]
 
 
@@ -339,6 +487,12 @@ def execute_tool(name: str, arguments: dict[str, Any], config: dict[str, Any]) -
             return _tool_meeting_overview(arguments, config)
         elif name == "shell_exec":
             return _tool_shell_exec(arguments)
+        elif name == "build_slides":
+            return _tool_build_slides(arguments)
+        elif name == "generate_image":
+            return _tool_generate_image(arguments)
+        elif name == "analyze_file":
+            return _tool_analyze_file(arguments)
         else:
             return f"Error: unknown tool '{name}'"
     except Exception as exc:
@@ -501,25 +655,46 @@ def _tool_web_search(args: dict[str, Any]) -> str:
     if not query:
         return "Error: query is required"
 
-    from src.agents.web_search import search_news
-    results = search_news(
-        topic=query,
-        keywords=query.split(),
-        max_results=args.get("max_results", 5),
-        time_range=args.get("time_range", "w"),
-    )
+    search_type = args.get("search_type", "web")
+    from src.agents.web_search import search_news, summarize_with_brave_ai
 
-    if not results:
-        return f"No web results found for '{query}'"
+    parts: list[str] = []
 
-    lines = [f"Web search results for '{query}':\n"]
-    for r in results:
-        title = r.get("title", "")
-        url = r.get("url", "")
-        snippet = r.get("snippet", "")
-        source = r.get("source", "")
-        lines.append(f"- **{title}** ({source})\n  {url}\n  {snippet}\n")
-    return "\n".join(lines)
+    if search_type == "ai":
+        summary = summarize_with_brave_ai(query, max_tokens=500)
+        if summary:
+            parts.append(f"## AI-Grounded Summary\n\n{summary}")
+        else:
+            parts.append("AI grounding unavailable, falling back to web search.")
+            search_type = "web"
+
+    if search_type in ("news", "web"):
+        results = search_news(
+            topic=query,
+            keywords=query.split(),
+            max_results=args.get("max_results", 5),
+            time_range=args.get("time_range", "w"),
+        )
+
+        if results:
+            parts.append(f"## Search Results for '{query}'\n")
+            for r in results:
+                title = r.get("title", "")
+                url = r.get("url", "")
+                snippet = r.get("snippet", "")
+                source = r.get("source", "")
+                date = r.get("date", "")
+                line = f"- **{title}**"
+                if source:
+                    line += f" ({source})"
+                if date:
+                    line += f" — {date}"
+                line += f"\n  {url}\n  {snippet}"
+                parts.append(line)
+        else:
+            parts.append(f"No web results found for '{query}'")
+
+    return "\n\n".join(parts) if parts else f"No results for '{query}'"
 
 
 def _tool_send_email(args: dict[str, Any]) -> str:
@@ -641,3 +816,78 @@ def _tool_shell_exec(args: dict[str, Any]) -> str:
         return output or "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: command timed out (30s limit)"
+
+
+def _tool_build_slides(args: dict[str, Any]) -> str:
+    title = args.get("title", "")
+    if not title:
+        return "Error: title is required"
+
+    from src.chat.pptx_builder import build_slides
+    result = build_slides(args)
+
+    if result.get("ok"):
+        filename = result["filename"]
+        count = result["slide_count"]
+        return (
+            f"Presentation built: **{title}** ({count} slides)\n"
+            f"Download: `/api/files/download/{filename}`"
+        )
+    else:
+        return f"Error building slides: {result.get('error', 'unknown')}"
+
+
+def _tool_generate_image(args: dict[str, Any]) -> str:
+    prompt = args.get("prompt", "")
+    if not prompt:
+        return "Error: prompt is required"
+
+    import shutil
+    import uuid
+    from src.agents.image_gen import generate_image
+
+    style = args.get("style", "editorial")
+    size = args.get("size", "1024x1024")
+    quality = args.get("quality", "medium")
+
+    result_path = generate_image(
+        topic_name=prompt[:80],
+        summary=prompt,
+        skill_name="chat",
+        style=style,
+        quality=quality,
+        size=size,
+    )
+
+    if not result_path:
+        return "Error: image generation failed (check OPENAI_API_KEY)"
+
+    generated_dir = REPO_DIR / "data" / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+
+    file_id = uuid.uuid4().hex[:10]
+    filename = f"image_{file_id}.png"
+    dest = generated_dir / filename
+    shutil.copy2(result_path, dest)
+
+    return (
+        f"Image generated successfully.\n\n"
+        f"![Generated image](/api/files/download/{filename})\n\n"
+        f"Download: `/api/files/download/{filename}`"
+    )
+
+
+def _tool_analyze_file(args: dict[str, Any]) -> str:
+    stored_name = args.get("stored_name", "")
+    if not stored_name:
+        return "Error: stored_name is required"
+
+    from src.chat.file_handler import get_upload_path, extract_text
+    path = get_upload_path(stored_name)
+    if path is None:
+        return f"Error: file not found: {stored_name}"
+
+    text = extract_text(path)
+    if len(text) > 30000:
+        text = text[:30000] + "\n\n... [truncated]"
+    return f"File: {stored_name}\nExtracted text ({len(text)} chars):\n\n{text}"

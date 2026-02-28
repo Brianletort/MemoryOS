@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memoryos.activity-summarizer</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{VENV_PYTHON}}</string>
+        <string>{{REPO_DIR}}/src/extractors/activity_summarizer.py</string>
+    </array>
+    <!-- Run every 30 minutes (1800 seconds), offset from the screenpipe extractor -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{REPO_DIR}}/logs/activity_summarizer_launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{REPO_DIR}}/logs/activity_summarizer_launchd.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>{{REPO_DIR}}</string>
+    </dict>
+</dict>
+</plist>

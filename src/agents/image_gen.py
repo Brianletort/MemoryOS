@@ -66,7 +66,7 @@ def _cache_dir(skill_name: str, date_str: str) -> Path:
     try:
         vault = _get_vault_path()
     except Exception:
-        vault = Path.home() / "Data" / "Obsidian" / "Letort"
+        vault = Path.home() / "Documents" / "Obsidian" / "MyVault"
     reports_dir = vault / "90_reports" / skill_name / "images" / date_str
     reports_dir.mkdir(parents=True, exist_ok=True)
     return reports_dir
